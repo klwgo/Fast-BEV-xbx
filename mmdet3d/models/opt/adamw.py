@@ -1,5 +1,5 @@
+import math
 import torch
-from torch.optim import _functional as F
 from torch.optim.optimizer import Optimizer
 from mmcv.runner.optimizer.builder import OPTIMIZERS
 
@@ -108,18 +108,38 @@ class AdamW2(Optimizer):
                 # record the step after step update
                 state_steps.append(state['step'])
 
-            F.adamw(
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-                amsgrad=amsgrad,
-                beta1=beta1,
-                beta2=beta2,
-                lr=group['lr'],
-                weight_decay=group['weight_decay'],
-                eps=group['eps'])
+            if len(params_with_grad) == 0:
+                continue
+
+            lr = group['lr']
+            weight_decay = group['weight_decay']
+            eps = group['eps']
+
+            bias_correction2 = [1 - beta2 ** step for step in state_steps]
+
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
+                exp_avg = exp_avgs[i]
+                exp_avg_sq = exp_avg_sqs[i]
+                step = state_steps[i]
+
+                if weight_decay != 0:
+                    param.add_(param, alpha=-lr * weight_decay)
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                if amsgrad:
+                    max_exp_avg_sq = max_exp_avg_sqs[i]
+                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+                    denom = max_exp_avg_sq.sqrt().add_(eps)
+                else:
+                    denom = exp_avg_sq.sqrt().add_(eps)
+
+                bias_correction1 = 1 - beta1 ** step
+                step_size = lr / bias_correction1
+
+                denom = denom / math.sqrt(bias_correction2[i])
+                param.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss

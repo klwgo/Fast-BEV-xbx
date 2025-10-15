@@ -18,13 +18,16 @@ import ipdb
 
 @DATASETS.register_module()
 class NuScenesMultiView_Map_Dataset2(NuScenesMultiViewDataset):
-    
+
     def __init__(self,
                  with_box2d=False,
+                 version='v1.0-mini',
                  **kwargs):
+        # 该版本号仅用于构建 NuScenes helper，本身不被父类识别
+        self.version = version
         super().__init__(**kwargs)
 
-        self.nusc = NuScenes(version='v1.0-mini', dataroot=self.data_root, verbose=True)
+        self.nusc = NuScenes(version=self.version, dataroot=self.data_root, verbose=True)
         self.scene2map = get_scene2map(self.nusc)
         self.maps = get_nusc_maps()
         # box 2d
