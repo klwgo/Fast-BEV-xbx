@@ -239,22 +239,11 @@ class NuScenesMultiView_Map_Dataset2(NuScenesMultiViewDataset):
                 new_bevseg_results.append(dict(seg_pred_road=seg_pred_road,
                                                seg_pred_lane=seg_pred_lane))
 
-                # bev seg gt path
-                seg_gt_path = 'data/nuscenes/maps_bev_seg_gt_2class/'
-                if not mmcv.is_filepath(seg_gt_path):
-                    # online generate map, too slow
-                    if i == 0:
-                        print('### first time need generate bev seg map online ###')
-                        print('### bev seg map is saved at:{} ###'.format(seg_gt_path))
-                    sample_token = self.get_data_info(i)['sample_idx']
-                    seg_gt = self._get_map_by_sample_token(sample_token)
-                    seg_gt_road, seg_gt_lane = seg_gt[..., 0], seg_gt[..., 1]
-                    mmcv.imwrite(seg_gt_road, seg_gt_path+'road/{}.png'.format(i), auto_mkdir=True)
-                    mmcv.imwrite(seg_gt_lane, seg_gt_path+'lane/{}.png'.format(i), auto_mkdir=True)
-
-                # load gt from local machine
-                seg_gt_road = mmcv.imread(seg_gt_path+'road/{}.png'.format(i), flag='grayscale').astype('float64')
-                seg_gt_lane = mmcv.imread(seg_gt_path+'lane/{}.png'.format(i), flag='grayscale').astype('float64')
+                # obtain gt map directly to avoid stale 0/255 PNG issues
+                sample_token = self.get_data_info(i)['sample_idx']
+                seg_gt = self._get_map_by_sample_token(sample_token)
+                seg_gt_road = seg_gt[..., 0].astype('float32')
+                seg_gt_lane = seg_gt[..., 1].astype('float32')
                 new_bevseg_gts_road.append(seg_gt_road)
                 new_bevseg_gts_lane.append(seg_gt_lane)
 
