@@ -109,11 +109,17 @@ class FreeAnchor3DHead(Anchor3DHead):
         box_prob = []
         num_pos = 0
         positive_losses = []
-        # ipdb.set_trace()
-        for _, (anchors_, gt_labels_, gt_bboxes_, cls_prob_, bbox_preds_,
+
+        for img_idx, (anchors_, gt_labels_, gt_bboxes_, cls_prob_, bbox_preds_,
                 dir_cls_preds_) in enumerate(
                     zip(anchors, gt_labels, gt_bboxes, cls_prob, bbox_preds,
                         dir_cls_preds)):
+
+            assert torch.isfinite(cls_prob_).all(), \
+                f"cls_prob contains inf/nan (img {img_idx})"
+            assert torch.isfinite(bbox_preds_).all(), \
+                f"bbox_preds contains inf/nan (img {img_idx})"
+            img_meta = input_metas[img_idx] if img_idx < len(input_metas) else dict()
 
             gt_bboxes_ = gt_bboxes_.tensor.to(anchors_.device)
 
@@ -188,6 +194,11 @@ class FreeAnchor3DHead(Anchor3DHead):
                 gt_labels_.view(-1, 1, 1).repeat(1, self.pre_anchor_topk,
                                                  1)).squeeze(2)
 
+            if torch.isnan(matched_cls_prob).any():
+                raise ValueError(
+                    f"matched_cls_prob NaN in sample {img_meta.get('sample_idx', img_idx)} "
+                    f"max={matched_cls_prob.max()} min={matched_cls_prob.min()}")
+
             # matched_box_prob: P_{ij}^{loc}
             matched_anchors = anchors_[matched]
             matched_object_targets = self.bbox_coder.encode(
@@ -228,6 +239,11 @@ class FreeAnchor3DHead(Anchor3DHead):
             if loss_dir is not None:
                 loss_bbox += loss_dir
             matched_box_prob = torch.exp(-loss_bbox)
+
+            if torch.isnan(matched_box_prob).any():
+                raise ValueError(
+                    f"matched_box_prob NaN in sample {img_meta.get('sample_idx', img_idx)} "
+                    f"max={matched_box_prob.max()} min={matched_box_prob.min()}")
 
             # positive_losses: {-log( Mean-max(P_{ij}^{cls} * P_{ij}^{loc}) )}
             num_pos += len(gt_bboxes_)
