@@ -12,6 +12,12 @@ from mmdet.models.detectors import BaseDetector
 from mmdet3d.core import bbox3d2result
 from mmseg.ops import resize
 from mmcv.runner import get_dist_info, auto_fp16
+from mmdet3d.models.utils import (
+    FisheyeLUTCache,
+    build_fisheye_lut,
+    prepare_calibrations,
+    make_lut_cache_key,
+)
 
 import copy
 
@@ -42,6 +48,7 @@ class FastBEV(BaseDetector):
         with_cp=False,
         backproject='inplace',
         style='v4',
+        fisheye_lut=None,
     ):
         super().__init__(init_cfg=init_cfg)
         self.backbone = build_backbone(backbone)
@@ -101,6 +108,35 @@ class FastBEV(BaseDetector):
         self.backproject = backproject
         # checkpoint
         self.with_cp = with_cp
+
+        # --- 鱼眼相机相关设置 -------------------------------------------------------
+        self.fisheye_lut_cfg = fisheye_lut or {}
+        # camera_model 决定是否启用鱼眼 LUT 分支
+        self.camera_model = self.fisheye_lut_cfg.get('camera_model', 'perspective')
+        assert self.camera_model in ['perspective', 'fisheye'], \
+            f"Unsupported camera_model `{self.camera_model}`"
+        if self.camera_model == 'fisheye':
+            # 初始化 LUT 缓存配置，可指定磁盘缓存目录等
+            cache_dir = self.fisheye_lut_cfg.get('cache_dir')
+            save_to_disk = self.fisheye_lut_cfg.get('save_to_disk', True)
+            self.fisheye_lut_cache = FisheyeLUTCache(
+                cache_dir=cache_dir,
+                save_to_disk=save_to_disk,
+            )
+            self.fisheye_distortion_key = self.fisheye_lut_cfg.get('distortion_key', 'distortion')
+            self.fisheye_model_key = self.fisheye_lut_cfg.get('model_key', 'models')
+            self.fisheye_intrinsic_key = self.fisheye_lut_cfg.get('intrinsic_key', 'intrinsic')
+            # 可通过 force_rebuild 强制每次重算 LUT，方便调试新标定
+            self.fisheye_force_rebuild = self.fisheye_lut_cfg.get('force_rebuild', False)
+            # 多相机聚合方式，默认取平均，可改为 'max' 以增强边界
+            self.fisheye_fusion_mode = self.fisheye_lut_cfg.get('fusion_mode', 'mean')
+        else:
+            self.fisheye_lut_cache = None
+            self.fisheye_distortion_key = None
+            self.fisheye_model_key = None
+            self.fisheye_intrinsic_key = None
+            self.fisheye_force_rebuild = False
+            self.fisheye_fusion_mode = 'mean'
 
     @staticmethod
     def _compute_projection(img_meta, stride, noise=0):
@@ -196,8 +232,6 @@ class FastBEV(BaseDetector):
                     height = math.ceil(img_meta["img_shape"][0] / stride_i)
                     width = math.ceil(img_meta["img_shape"][1] / stride_i)
 
-                    projection = self._compute_projection(
-                        img_meta, stride_i, noise=self.extrinsic_noise).to(feat_i.device)
                     if self.style in ['v1', 'v2']:
                         # wo/ bev ms
                         n_voxels, voxel_size = self.n_voxels[0], self.voxel_size[0]
@@ -210,18 +244,38 @@ class FastBEV(BaseDetector):
                         origin=torch.tensor(img_meta["lidar2img"]["origin"]),
                     ).to(feat_i.device)
 
-                    if self.backproject == 'inplace':
-                        volume = backproject_inplace(
-                            feat_i[:, :, :height, :width], points, projection)  # [c, vx, vy, vz]
+                    if self.camera_model == 'fisheye':
+                        # 鱼眼模式：优先查找预计算 LUT，并将特征直接映射回 BEV
+                        pixel_indices, valid_mask = self._get_fisheye_lut(
+                            img_meta=img_meta,
+                            points=points,
+                            stride=stride_i,
+                            height=height,
+                            width=width,
+                            voxel_size=torch.tensor(voxel_size, dtype=points.dtype, device=points.device),
+                        )
+                        volume = backproject_with_lut(
+                            feat_i[:, :, :height, :width],
+                            tuple(int(v) for v in n_voxels),
+                            pixel_indices,
+                            valid_mask,
+                            fusion_mode=self.fisheye_fusion_mode,
+                        )
                     else:
-                        volume, valid = backproject_vanilla(
-                            feat_i[:, :, :height, :width], points, projection)
-                        volume = volume.sum(dim=0)
-                        valid = valid.sum(dim=0)
-                        volume = volume / valid
-                        valid = valid > 0
-                        volume[:, ~valid[0]] = 0.0
-
+                        # 透视模式维持原始投影流程
+                        projection = self._compute_projection(
+                            img_meta, stride_i, noise=self.extrinsic_noise).to(feat_i.device)
+                        if self.backproject == 'inplace':
+                            volume = backproject_inplace(
+                                feat_i[:, :, :height, :width], points, projection)  # [c, vx, vy, vz]
+                        else:
+                            volume, valid = backproject_vanilla(
+                                feat_i[:, :, :height, :width], points, projection)
+                            volume = volume.sum(dim=0)
+                            valid = valid.sum(dim=0)
+                            volume = volume / valid
+                            valid = valid > 0
+                            volume[:, ~valid[0]] = 0.0
                     volumes.append(volume)
                 volume_list.append(torch.stack(volumes))  # list([bs, c, vx, vy, vz])
     
@@ -270,6 +324,96 @@ class FastBEV(BaseDetector):
             x = _inner_forward(x)
 
         return x, None, features_2d
+
+    def _get_fisheye_lut(
+        self,
+        img_meta,
+        points,
+        stride,
+        height,
+        width,
+        voxel_size,
+    ):
+        """依据当前样本标定信息获取（或创建）鱼眼 LUT，用于回填 BEV 体素。"""
+
+        assert self.fisheye_lut_cache is not None, "Fish-eye LUT cache is not initialised."
+
+        lidar2img = img_meta["lidar2img"]
+        # 读取鱼眼相机参数（支持每帧多相机独立标定）
+        intrinsic_raw = lidar2img.get(self.fisheye_intrinsic_key)
+        if intrinsic_raw is None:
+            raise KeyError("Fish-eye intrinsics not found in img_meta['lidar2img'].")
+        # 兼容 3x3 或 4x4 齐次内参矩阵，只保留前 3x3 投影部分
+        intrinsic = torch.as_tensor(intrinsic_raw)
+        if intrinsic.ndim == 2 and intrinsic.shape[0] == 4:
+            intrinsic = intrinsic[:3, :3]
+        elif intrinsic.ndim == 3 and intrinsic.shape[1] == 4:
+            intrinsic = intrinsic[:, :3, :3]
+
+        # 外参通常为多个相机的 4x4 齐次矩阵
+        extrinsics = [torch.as_tensor(ex) for ex in lidar2img["extrinsic"]]
+
+        distortion_raw = None
+        if self.fisheye_distortion_key is not None:
+            distortion_raw = lidar2img.get(self.fisheye_distortion_key)
+        distortion = None
+        if distortion_raw is not None:
+            # 畸变参数可能按相机存储成列表
+            distortion = [torch.as_tensor(d) for d in distortion_raw]
+
+        model_list = None
+        if self.fisheye_model_key is not None and self.fisheye_model_key in lidar2img:
+            # 如果数据集中每个相机使用不同鱼眼模型，可在此读取
+            model_list = lidar2img[self.fisheye_model_key]
+
+        calibrations = prepare_calibrations(
+            intrinsic=intrinsic,
+            extrinsics=extrinsics,
+            distortion=distortion,
+            model_per_cam=model_list,
+        )
+
+        origin_tensor = torch.as_tensor(
+            lidar2img["origin"],
+            dtype=points.dtype,
+            device=points.device,
+        )
+        voxel_size_tensor = voxel_size.to(points.device)
+
+        # 使用标定、体素参数与下采样步长生成缓存 key，保证 LUT 可复用
+        cache_key = make_lut_cache_key(
+            calibrations=calibrations,
+            stride=stride,
+            voxel_size=voxel_size_tensor,
+            origin=origin_tensor,
+        )
+
+        if self.fisheye_force_rebuild:
+            self.fisheye_lut_cache.memory_cache.pop(cache_key, None)
+            if self.fisheye_lut_cache.cache_dir is not None:
+                disk_path = self.fisheye_lut_cache.cache_dir / f"{cache_key}.pt"
+                if disk_path.exists():
+                    disk_path.unlink()
+
+        def _builder():
+            # 首次缓存未命中时触发构建逻辑
+            with torch.no_grad():
+                lut, valid = build_fisheye_lut(
+                    points=points,
+                    cameras=calibrations,
+                    height=height,
+                    width=width,
+                    stride=stride,
+                )
+            return lut.cpu(), valid.cpu()
+
+        # 尝试从缓存中读取 LUT，若不存在则调用 _builder 重新生成
+        lut, valid = self.fisheye_lut_cache.get_lut(cache_key, _builder)
+        if lut.dim() == 2 and lut.shape[1] == 2:
+            raise RuntimeError(
+                "检测到旧版鱼眼 LUT 格式，请删除缓存或设置 fisheye_lut.force_rebuild=True 重新生成。"
+            )
+        return lut.to(points.device), valid.to(points.device)
 
     @auto_fp16(apply_to=('img', ))
     def forward(self, img, img_metas, return_loss=True, **kwargs):
@@ -504,6 +648,81 @@ def backproject_vanilla(features, points, projection):
     # [6, 480000] -> [6, 1, 200, 200, 12]
     valid = valid.view(n_images, 1, n_x_voxels, n_y_voxels, n_z_voxels)
     return volume, valid
+
+
+@torch.no_grad()
+def backproject_with_lut(features, n_voxels, pixel_indices, valid_mask, fusion_mode='mean'):
+    '''
+    功能：利用预先计算好的鱼眼 LUT，将多相机特征快速回投影到 BEV 体素。
+    输入:
+        features: [nv, c, h, w]
+        n_voxels: (vx, vy, vz)
+        pixel_indices: [nv, vx*vy*vz] -> y * width + x
+        valid_mask: [nv, vx*vy*vz] -> bool
+        fusion_mode: 聚合方式，支持 'mean'、'max'
+    输出:
+        volume: [c, vx, vy, vz]
+    '''
+
+    n_images, n_channels, height, width = features.shape
+    total_voxels = int(n_voxels[0] * n_voxels[1] * n_voxels[2])
+    assert pixel_indices.shape == (n_images, total_voxels), \
+        "LUT 与相机/体素数量不匹配"
+    assert valid_mask.shape == (n_images, total_voxels), \
+        "valid_mask 与相机/体素数量不匹配"
+
+    pixel_indices = pixel_indices.to(features.device)
+    valid_mask = valid_mask.to(features.device)
+
+    # 展平特征以便快速索引采样
+    features_flat = features.reshape(n_images, n_channels, height * width)
+
+    if fusion_mode not in ['mean', 'max']:
+        raise ValueError(f"不支持的融合方式 {fusion_mode}")
+
+    volume = torch.zeros(
+        (n_channels, total_voxels),
+        device=features.device,
+        dtype=features.dtype,
+    )
+
+    if fusion_mode == 'mean':
+        # 平均池化：记录累积值与有效相机数量
+        counts = torch.zeros(
+            total_voxels, device=features.device, dtype=features.dtype
+        )
+    elif fusion_mode == 'max':
+        # 最大池化：以极小值初始化，后续逐相机取最大
+        volume.fill_(-torch.finfo(features.dtype).max)
+
+    for cam_id in range(n_images):
+        cam_mask = valid_mask[cam_id]
+        if not cam_mask.any():
+            continue
+        dst_indices = torch.nonzero(cam_mask, as_tuple=False).squeeze(1)
+        src_indices = pixel_indices[cam_id, cam_mask].to(torch.long)
+        sampled = features_flat[cam_id, :, src_indices]
+
+        if fusion_mode == 'mean':
+            volume[:, dst_indices] += sampled
+            counts[dst_indices] += 1
+        else:
+            # 最大池化：逐像素比较，保留强响应
+            volume[:, dst_indices] = torch.maximum(
+                volume[:, dst_indices], sampled
+            )
+
+    if fusion_mode == 'mean':
+        valid = counts > 0
+        if valid.any():
+            volume[:, valid] = volume[:, valid] / counts[valid]
+        volume[:, ~valid] = 0
+    else:
+        # max 模式下，将未被任何相机覆盖的体素置零
+        cover = valid_mask.any(dim=0)
+        volume[:, ~cover] = 0
+
+    return volume.view(n_channels, *n_voxels)
 
 
 def backproject_inplace(features, points, projection):
