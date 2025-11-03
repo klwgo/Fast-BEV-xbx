@@ -123,13 +123,40 @@ class FreeAnchor3DHead(Anchor3DHead):
 
             gt_bboxes_ = gt_bboxes_.tensor.to(anchors_.device)
 
+            def _align_bbox_dims_for_iou(bboxes1, bboxes2):
+                """Ensure IoU calculation uses shared box dimensions.
+
+                WoodScape annotations目前提供包含速度的9维框，而anchor解码结果可能
+                依据配置只包含7维几何信息。为避免维度不一致导致的断言错误，这里对两端
+                的框取共同维度（至少包含7个几何维）参与IoU计算。
+                """
+                if bboxes1.size(-1) == bboxes2.size(-1):
+                    return bboxes1, bboxes2
+                shared_dim = min(bboxes1.size(-1), bboxes2.size(-1))
+                assert shared_dim >= 7, \
+                    f'Shared bbox dim {shared_dim} < 7, cannot compute IoU safely.'
+                return bboxes1[..., :shared_dim], bboxes2[..., :shared_dim]
+
+            def _match_box_dim(boxes, target_dim):
+                """Pad or截断 boxes 以匹配 anchor / 预测框维度."""
+                if boxes.size(-1) == target_dim:
+                    return boxes
+                if boxes.size(-1) > target_dim:
+                    return boxes[..., :target_dim]
+                pad_shape = boxes.shape[:-1] + (target_dim - boxes.size(-1),)
+                pad = boxes.new_zeros(pad_shape)
+                return torch.cat([boxes, pad], dim=-1)
+
             with torch.no_grad():
                 # box_localization: a_{j}^{loc}, shape: [j, 4]
                 pred_boxes = self.bbox_coder.decode(anchors_, bbox_preds_)
 
                 # object_box_iou: IoU_{ij}^{loc}, shape: [i, j]
                 # gt_bboxes_: [8, 9] pred_boxes: [320000, 9]
-                object_box_iou = bbox_overlaps_nearest_3d(gt_bboxes_, pred_boxes)
+                gt_iou_boxes, pred_iou_boxes = _align_bbox_dims_for_iou(
+                    gt_bboxes_, pred_boxes)
+                object_box_iou = bbox_overlaps_nearest_3d(
+                    gt_iou_boxes, pred_iou_boxes)
 
                 # object_box_prob: P{a_{j} -> b_{i}}, shape: [i, j]
                 t1 = self.bbox_thr
@@ -179,8 +206,10 @@ class FreeAnchor3DHead(Anchor3DHead):
                 box_prob.append(image_box_prob)
 
             # construct bags for objects
-            match_quality_matrix = bbox_overlaps_nearest_3d(
+            gt_anchor_boxes, anchor_iou_boxes = _align_bbox_dims_for_iou(
                 gt_bboxes_, anchors_)
+            match_quality_matrix = bbox_overlaps_nearest_3d(
+                gt_anchor_boxes, anchor_iou_boxes)
             _, matched = torch.topk(
                 match_quality_matrix,
                 self.pre_anchor_topk,
@@ -201,9 +230,12 @@ class FreeAnchor3DHead(Anchor3DHead):
 
             # matched_box_prob: P_{ij}^{loc}
             matched_anchors = anchors_[matched]
+            matched_gt_boxes = _match_box_dim(
+                gt_bboxes_, matched_anchors.size(-1)).unsqueeze(
+                    dim=1).expand_as(matched_anchors)
             matched_object_targets = self.bbox_coder.encode(
                 matched_anchors,
-                gt_bboxes_.unsqueeze(dim=1).expand_as(matched_anchors))
+                matched_gt_boxes)
 
             # direction classification loss
             loss_dir = None

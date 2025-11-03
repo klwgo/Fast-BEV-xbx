@@ -22,3 +22,17 @@ if distutils is not None and not hasattr(distutils, "version"):
             logging.getLogger(__name__).debug(
                 "无法预加载 distutils.version，原始异常：%s", exc
             )
+
+# ---------------------------------------------------------------------- #
+# 兼容 numpy 2.0 生成的 pickle：为旧版本 numpy 补上 numpy._core 别名
+# ---------------------------------------------------------------------- #
+try:  # pragma: no cover - 启动阶段的兼容处理
+    import numpy as _np  # noqa: F401
+    if not hasattr(_np, "_core") and hasattr(_np, "core"):
+        import types
+        import sys
+
+        sys.modules.setdefault("numpy._core", _np.core)
+        _np._core = _np.core
+except Exception:  # noqa: E722 - 兼容性兜底
+    pass

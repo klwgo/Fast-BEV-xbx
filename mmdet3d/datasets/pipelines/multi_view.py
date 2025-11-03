@@ -7,11 +7,13 @@ import ipdb
 
 @PIPELINES.register_module()
 class MultiViewPipeline:
-    def __init__(self, transforms, n_images, n_times=2, sequential=False):
+    def __init__(self, transforms, n_images, n_times=2, sequential=False, expected_views=6):
         self.transforms = Compose(transforms)
         self.n_images = n_images
         self.n_times = n_times
         self.sequential = sequential
+        # expected_views 用于校验相机数量，WoodScape 为 4 目，可在配置中传入 4
+        self.expected_views = expected_views
 
     def __sort_list(self, old_list, order):
         new_list = []
@@ -23,13 +25,19 @@ class MultiViewPipeline:
         imgs = []
         extrinsics = []
         if not self.sequential:
-            assert len(results['img_info']) == 6
+            num_views = len(results['img_info'])
+            if self.expected_views is not None:
+                assert num_views == self.expected_views, \
+                    f'期望 {self.expected_views} 个视角，实际得到 {num_views} 个，请检查数据/配置。'
             ids = np.arange(len(results['img_info']))
             replace = True if self.n_images > len(ids) else False
             ids = np.random.choice(ids, self.n_images, replace=replace)
             ids_list = sorted(ids)  # sort & tolist
         else:
-            assert len(results['img_info']) == 6 * self.n_times, f'img info: {len(results["img_info"])}, n_times: {self.n_times}'
+            num_views = len(results['img_info'])
+            if self.expected_views is not None:
+                assert num_views == self.expected_views * self.n_times, \
+                    f'期望 {self.expected_views * self.n_times} 张图像 (相机数×时间步)，实际得到 {num_views}。'
             ids_list = np.arange(len(results['img_info'])).tolist()
         for i in ids_list:
             _results = dict()

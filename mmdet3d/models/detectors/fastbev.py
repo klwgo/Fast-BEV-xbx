@@ -49,6 +49,7 @@ class FastBEV(BaseDetector):
         backproject='inplace',
         style='v4',
         fisheye_lut=None,
+        num_views=6,
     ):
         super().__init__(init_cfg=init_cfg)
         self.backbone = build_backbone(backbone)
@@ -108,6 +109,8 @@ class FastBEV(BaseDetector):
         self.backproject = backproject
         # checkpoint
         self.with_cp = with_cp
+        self.num_views = num_views
+        assert self.num_views > 0, 'num_views 必须为正整数'
 
         # --- 鱼眼相机相关设置 -------------------------------------------------------
         self.fisheye_lut_cfg = fisheye_lut or {}
@@ -217,7 +220,7 @@ class FastBEV(BaseDetector):
             # [bs*seq*nv, c, h, w] -> [bs, seq*nv, c, h, w]
             mlvl_feat = mlvl_feat.reshape([batch_size, -1] + list(mlvl_feat.shape[1:]))
             # [bs, seq*nv, c, h, w] -> list([bs, nv, c, h, w])
-            mlvl_feat_split = torch.split(mlvl_feat, 6, dim=1)
+            mlvl_feat_split = torch.split(mlvl_feat, self.num_views, dim=1)
 
             volume_list = []
             for seq_id in range(len(mlvl_feat_split)):
@@ -225,9 +228,13 @@ class FastBEV(BaseDetector):
                 for batch_id, seq_img_meta in enumerate(img_metas):
                     feat_i = mlvl_feat_split[seq_id][batch_id]  # [nv, c, h, w]
                     img_meta = copy.deepcopy(seq_img_meta)
-                    img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][seq_id*6:(seq_id+1)*6]
+                    img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][
+                        seq_id * self.num_views:(seq_id + 1) * self.num_views
+                    ]
                     if isinstance(img_meta["img_shape"], list):
-                        img_meta["img_shape"] = img_meta["img_shape"][seq_id*6:(seq_id+1)*6]
+                        img_meta["img_shape"] = img_meta["img_shape"][
+                            seq_id * self.num_views:(seq_id + 1) * self.num_views
+                        ]
                         img_meta["img_shape"] = img_meta["img_shape"][0]
                     height = math.ceil(img_meta["img_shape"][0] / stride_i)
                     width = math.ceil(img_meta["img_shape"][1] / stride_i)
