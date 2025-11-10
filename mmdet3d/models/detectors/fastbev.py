@@ -2,6 +2,7 @@
 import math
 import os
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
@@ -12,6 +13,7 @@ from mmdet.models.detectors import BaseDetector
 from mmdet3d.core import bbox3d2result
 from mmseg.ops import resize
 from mmcv.runner import get_dist_info, auto_fp16
+from mmcv.parallel import DataContainer
 from mmdet3d.models.utils import (
     FisheyeLUTCache,
     build_fisheye_lut,
@@ -463,38 +465,225 @@ class FastBEV(BaseDetector):
             loss_det = self.bbox_head.loss(*x, gt_bboxes_3d, gt_labels_3d, img_metas)
             losses.update(loss_det)
 
-        if self.seg_head is not None:
-            assert len(gt_bev_seg) == 1
+        if self.seg_head is not None and gt_bev_seg is not None:
             x_bev = self.seg_head(feature_bev)
-            gt_bev = gt_bev_seg[0][None, ...].long()
+
+            if isinstance(gt_bev_seg, (list, tuple)):
+                gt_list = []
+                for seg in gt_bev_seg:
+                    if not torch.is_tensor(seg):
+                        seg = torch.as_tensor(seg, device=x_bev.device)
+                    gt_list.append(seg.long().to(x_bev.device))
+                gt_bev = torch.stack(gt_list, dim=0)
+            else:
+                gt_bev = gt_bev_seg.long().to(x_bev.device)
+
             loss_seg = self.seg_head.losses(x_bev, gt_bev)
             losses.update(loss_seg)
 
-        if self.bbox_head_2d is not None:
-            gt_bboxes = kwargs["gt_bboxes"][0]
-            gt_labels = kwargs["gt_labels"][0]
-            assert len(kwargs["gt_bboxes"]) == 1 and len(kwargs["gt_labels"]) == 1
-            # hack a img_metas_2d
-            img_metas_2d = []
-            img_info = img_metas[0]["img_info"]
-            for idx, info in enumerate(img_info):
-                tmp_dict = dict(
-                    filename=info["filename"],
-                    ori_filename=info["filename"].split("/")[-1],
-                    ori_shape=img_metas[0]["ori_shape"],
-                    img_shape=img_metas[0]["img_shape"],
-                    pad_shape=img_metas[0]["pad_shape"],
-                    scale_factor=img_metas[0]["scale_factor"],
-                    flip=False,
-                    flip_direction=None,
-                )
-                img_metas_2d.append(tmp_dict)
+        if self.bbox_head_2d is not None and features_2d is not None:
+            gt_bboxes_batch = kwargs.get("gt_bboxes", [])
+            gt_labels_batch = kwargs.get("gt_labels", [])
+            mv_bboxes_batch = []
+            mv_labels_batch = []
+            if "mv_bboxes" in kwargs:
+                mv_raw = kwargs["mv_bboxes"]
+                mv_bboxes_batch = mv_raw.data if isinstance(mv_raw, DataContainer) else mv_raw
+            if "mv_labels" in kwargs:
+                mv_raw = kwargs["mv_labels"]
+                mv_labels_batch = mv_raw.data if isinstance(mv_raw, DataContainer) else mv_raw
+            # fall back to mv_bboxes stored in img_metas when gt_bboxes is empty
+            if len(gt_bboxes_batch) == 0:
+                gt_bboxes_batch = [None] * len(img_metas)
+                gt_labels_batch = [None] * len(img_metas)
 
-            rank, world_size = get_dist_info()
-            loss_2d = self.bbox_head_2d.forward_train(
-                features_2d, img_metas_2d, gt_bboxes, gt_labels
-            )
-            losses.update(loss_2d)
+            def _get_view_value(meta, key, idx, default=None):
+                value = meta.get(key, default)
+                if isinstance(value, (list, tuple)):
+                    if idx < len(value):
+                        return value[idx]
+                    return value[0]
+                return value
+
+            base_device = None
+            if isinstance(feature_bev, torch.Tensor):
+                base_device = feature_bev.device
+            elif isinstance(feature_bev, (list, tuple)) and feature_bev and isinstance(feature_bev[0], torch.Tensor):
+                base_device = feature_bev[0].device
+            if base_device is None and isinstance(features_2d, (list, tuple)) and features_2d and isinstance(features_2d[0], torch.Tensor):
+                base_device = features_2d[0].device
+            if base_device is None:
+                base_device = torch.device('cpu')
+
+            def _has_valid_targets(value):
+                if value is None:
+                    return False
+                if isinstance(value, DataContainer):
+                    value = value.data
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        if _has_valid_targets(item):
+                            return True
+                    return False
+                if torch.is_tensor(value):
+                    return value.numel() > 0
+                try:
+                    return len(value) > 0
+                except Exception:
+                    return False
+
+            def _reshape_tensor(tensor, is_bbox, device):
+                tensor = tensor.to(device)
+                if is_bbox:
+                    tensor = tensor.to(dtype=torch.float32)
+                    if tensor.numel() == 0:
+                        return tensor.new_zeros((0, 4))
+                    tensor = tensor.reshape(-1)
+                    if tensor.numel() % 4 != 0:
+                        raise ValueError(f"[Fast-BEV] Invalid bbox tensor with "
+                                         f"numel={tensor.numel()}")
+                    tensor = tensor.reshape(-1, 4)
+                else:
+                    tensor = tensor.to(dtype=torch.long)
+                    tensor = tensor.reshape(-1)
+                return tensor
+
+            def _convert_to_view_list(value, is_bbox, device):
+                if value is None:
+                    return None
+                if isinstance(value, DataContainer):
+                    value = value.data
+                if isinstance(value, (list, tuple)):
+                    tensors = []
+                    for item in value:
+                        if item is None:
+                            if is_bbox:
+                                tensors.append(torch.zeros((0, 4), dtype=torch.float32, device=device))
+                            else:
+                                tensors.append(torch.zeros((0,), dtype=torch.long, device=device))
+                            continue
+                        if torch.is_tensor(item):
+                            tensors.append(_reshape_tensor(item, is_bbox, device))
+                        else:
+                            dtype = torch.float32 if is_bbox else torch.long
+                            tensor = torch.as_tensor(item, dtype=dtype, device=device)
+                            tensors.append(_reshape_tensor(tensor, is_bbox, device))
+                    return tensors
+                if torch.is_tensor(value):
+                    tensor = _reshape_tensor(value, is_bbox, device)
+                else:
+                    dtype = torch.float32 if is_bbox else torch.long
+                    tensor = torch.as_tensor(value, dtype=dtype, device=device)
+                    tensor = _reshape_tensor(tensor, is_bbox, device)
+                return [tensor]
+
+            def _prepare_targets(primary, fallback, num_views, is_bbox, device):
+                source = primary if _has_valid_targets(primary) else None
+                if source is None and _has_valid_targets(fallback):
+                    source = fallback
+                if source is None:
+                    return None
+                tensors = _convert_to_view_list(source, is_bbox, device)
+                if tensors is None:
+                    return None
+                if len(tensors) < num_views:
+                    pad_shape = (0, 4) if is_bbox else (0,)
+                    pad = torch.zeros(pad_shape,
+                                      dtype=torch.float32 if is_bbox else torch.long,
+                                      device=device)
+                    tensors = list(tensors) + [pad.clone() for _ in range(num_views - len(tensors))]
+                elif len(tensors) > num_views:
+                    tensors = tensors[:num_views]
+                return tensors
+
+            loss_2d_accum = {}
+            processed = 0
+            for sample_idx, meta in enumerate(img_metas):
+                if sample_idx < len(gt_bboxes_batch):
+                    gt_bboxes = gt_bboxes_batch[sample_idx]
+                    gt_labels = gt_labels_batch[sample_idx]
+                else:
+                    gt_bboxes = None
+                    gt_labels = None
+
+                sample_feats = []
+                for lvl_feat in features_2d:
+                    start = sample_idx * self.num_views
+                    end = (sample_idx + 1) * self.num_views
+                    sample_feats.append(lvl_feat[start:end])
+                device = sample_feats[0].device if sample_feats else base_device
+                mv_bboxes_src = meta.get("mv_bboxes")
+                if (not _has_valid_targets(mv_bboxes_src)) and mv_bboxes_batch:
+                    mv_bboxes_src = mv_bboxes_batch[sample_idx] if sample_idx < len(mv_bboxes_batch) else None
+                if (not _has_valid_targets(mv_bboxes_src)) and "ann_info" in meta:
+                    mv_bboxes_src = meta["ann_info"].get("mv_bboxes")
+
+                mv_labels_src = meta.get("mv_labels")
+                if (not _has_valid_targets(mv_labels_src)) and mv_labels_batch:
+                    mv_labels_src = mv_labels_batch[sample_idx] if sample_idx < len(mv_labels_batch) else None
+                if (not _has_valid_targets(mv_labels_src)) and "ann_info" in meta:
+                    mv_labels_src = meta["ann_info"].get("mv_labels")
+
+                num_views = len(meta["img_info"])
+                gt_bboxes_list = _prepare_targets(
+                    gt_bboxes, mv_bboxes_src, num_views, True, device)
+                gt_labels_list = _prepare_targets(
+                    gt_labels, mv_labels_src, num_views, False, device)
+
+                if gt_bboxes_list is None or gt_labels_list is None:
+                    continue
+
+                # ensure each view has targets tensor
+                if len(gt_bboxes_list) != len(gt_labels_list):
+                    continue
+
+                if len(gt_bboxes_list) == 0 or len(gt_labels_list) == 0:
+                    continue
+
+                img_metas_2d = []
+                img_info_list = meta["img_info"]
+                for view_idx, info in enumerate(img_info_list):
+                    pad_shape = _get_view_value(meta, "pad_shape", view_idx, meta.get("img_shape"))
+                    if pad_shape is None:
+                        pad_shape = meta.get("ori_shape")
+                    img_shape = _get_view_value(meta, "img_shape", view_idx, meta.get("ori_shape"))
+                    ori_shape = _get_view_value(meta, "ori_shape", view_idx, img_shape)
+                    if isinstance(pad_shape, list):
+                        pad_shape = tuple(pad_shape)
+                    if isinstance(img_shape, list):
+                        img_shape = tuple(img_shape)
+                    if isinstance(ori_shape, list):
+                        ori_shape = tuple(ori_shape)
+                    scale_factor = _get_view_value(meta, "scale_factor", view_idx, 1.0)
+                    tmp_dict = dict(
+                        filename=info["filename"],
+                        ori_filename=info["filename"].split("/")[-1],
+                        ori_shape=ori_shape,
+                        img_shape=img_shape,
+                        pad_shape=pad_shape,
+                        scale_factor=scale_factor,
+                        flip=False,
+                        flip_direction=None,
+                    )
+                    img_metas_2d.append(tmp_dict)
+
+                loss_2d = self.bbox_head_2d.forward_train(
+                    sample_feats, img_metas_2d, gt_bboxes_list, gt_labels_list
+                )
+                for k, v in loss_2d.items():
+                    if k in loss_2d_accum:
+                        loss_2d_accum[k] = loss_2d_accum[k] + v
+                    else:
+                        loss_2d_accum[k] = v
+                processed += 1
+
+            if processed > 0:
+                for k, v in loss_2d_accum.items():
+                    mean_loss = v / processed
+                    if k in losses:
+                        losses[k] = losses[k] + mean_loss
+                    else:
+                        losses[k] = mean_loss
 
         return losses
 
@@ -567,16 +756,100 @@ class FastBEV(BaseDetector):
                 bbox3d2result(det_bboxes, det_scores, det_labels)
                 for det_bboxes, det_scores, det_labels in bbox_list
             ]
-
         else:
-            bbox_results = [dict()]
+            bbox_results = [dict() for _ in range(len(img_metas))]
 
         # BEV semantic seg
         if self.seg_head is not None:
             x_bev = self.seg_head(feature_bev)
-            bbox_results[0]['bev_seg'] = x_bev
+            for idx, bev_res in enumerate(x_bev):
+                bbox_results[idx]['bev_seg'] = bev_res
+
+        if self.bbox_head_2d is not None and features_2d is not None:
+            mv_results = self._simple_test_multiview_2d(features_2d, img_metas)
+            for sample_idx, mv_res in enumerate(mv_results):
+                bbox_results[sample_idx].update(mv_res)
 
         return bbox_results
+
+    def _simple_test_multiview_2d(self, features_2d, img_metas):
+        mv_results = []
+        num_samples = len(img_metas)
+
+        def _get_view_value(meta, key, idx, default=None):
+            value = meta.get(key, default)
+            if isinstance(value, (list, tuple)):
+                if idx < len(value):
+                    return value[idx]
+                return value[0]
+            return value
+
+        for sample_idx in range(num_samples):
+            sample_feats = []
+            for lvl_feat in features_2d:
+                start = sample_idx * self.num_views
+                end = (sample_idx + 1) * self.num_views
+                sample_feats.append(lvl_feat[start:end])
+            if not sample_feats or sample_feats[0].numel() == 0:
+                mv_results.append(dict(
+                    mv_bboxes=[np.zeros((0, 4), dtype=np.float32) for _ in range(self.num_views)],
+                    mv_scores=[np.zeros((0,), dtype=np.float32) for _ in range(self.num_views)],
+                    mv_labels=[np.zeros((0,), dtype=np.int64) for _ in range(self.num_views)],
+                ))
+                continue
+
+            img_metas_2d = []
+            img_info_list = img_metas[sample_idx].get("img_info", [])
+            for view_idx in range(self.num_views):
+                info = img_info_list[view_idx] if view_idx < len(img_info_list) else {}
+                pad_shape = _get_view_value(img_metas[sample_idx], "pad_shape", view_idx, img_metas[sample_idx].get("img_shape"))
+                if pad_shape is None:
+                    pad_shape = img_metas[sample_idx].get("ori_shape")
+                img_shape = _get_view_value(img_metas[sample_idx], "img_shape", view_idx, img_metas[sample_idx].get("ori_shape"))
+                ori_shape = _get_view_value(img_metas[sample_idx], "ori_shape", view_idx, img_shape)
+                if isinstance(pad_shape, list):
+                    pad_shape = tuple(pad_shape)
+                if isinstance(img_shape, list):
+                    img_shape = tuple(img_shape)
+                if isinstance(ori_shape, list):
+                    ori_shape = tuple(ori_shape)
+                scale_factor = _get_view_value(img_metas[sample_idx], "scale_factor", view_idx, 1.0)
+                tmp_dict = dict(
+                    filename=info.get("filename", ""),
+                    ori_filename=info.get("filename", "").split("/")[-1] if info.get("filename") else "",
+                    ori_shape=ori_shape,
+                    img_shape=img_shape,
+                    pad_shape=pad_shape,
+                    scale_factor=scale_factor,
+                    flip=False,
+                    flip_direction=None,
+                )
+                img_metas_2d.append(tmp_dict)
+
+            det_results = self.bbox_head_2d.simple_test_bboxes(
+                sample_feats, img_metas_2d, rescale=False)
+
+            mv_bboxes = []
+            mv_scores = []
+            mv_labels = []
+            for det_bbox, det_label in det_results:
+                if det_bbox.numel() == 0:
+                    mv_bboxes.append(np.zeros((0, 4), dtype=np.float32))
+                    mv_scores.append(np.zeros((0,), dtype=np.float32))
+                    mv_labels.append(np.zeros((0,), dtype=np.int64))
+                    continue
+                det_bbox_np = det_bbox.detach().cpu().numpy()
+                det_label_np = det_label.detach().cpu().numpy()
+                mv_bboxes.append(det_bbox_np[:, :4])
+                mv_scores.append(det_bbox_np[:, 4])
+                mv_labels.append(det_label_np.astype(np.int64))
+
+            mv_results.append(dict(
+                mv_bboxes=mv_bboxes,
+                mv_scores=mv_scores,
+                mv_labels=mv_labels,
+            ))
+        return mv_results
 
     def aug_test(self, imgs, img_metas):
         img_shape_copy = copy.deepcopy(img_metas[0]['img_shape'])

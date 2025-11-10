@@ -22,6 +22,9 @@ class MultiViewPipeline:
         return new_list
 
     def __call__(self, results):
+        ann_info = results.get('ann_info')
+        mv_bboxes_backup = results.get('mv_bboxes')
+        mv_labels_backup = results.get('mv_labels')
         imgs = []
         extrinsics = []
         if not self.sequential:
@@ -60,6 +63,12 @@ class MultiViewPipeline:
             results['gt_bboxes_ignore'] = gt_bboxes_ignore
 
         results['lidar2img']['extrinsic'] = extrinsics
+        if ann_info is not None:
+            results['ann_info'] = ann_info
+        if mv_bboxes_backup is not None:
+            results['mv_bboxes'] = mv_bboxes_backup
+        if mv_labels_backup is not None:
+            results['mv_labels'] = mv_labels_backup
         return results
 
 

@@ -42,7 +42,7 @@ def _ensure_numpy_core_alias():
 _ensure_numpy_core_alias()
 
 EXPECTED_CAMERAS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK']
-OBSTACLE_CLASSES = {'pedestrian', 'four-wheeler vehicle', 'two-wheeler vehicle'}
+AUTO_TOKEN = '__auto__'
 ROAD_MARKING_CLASSES = {
     'lane_marking',
     'parking_line',
@@ -206,7 +206,7 @@ def is_numpy_array(x, ndim=None):
     return ok
 
 def main(pkl_path: Path,
-         obstacle_classes=OBSTACLE_CLASSES,
+         obstacle_classes,
          marking_classes=ROAD_MARKING_CLASSES,
          drivable_classes=DRIVABLE_AREA_CLASSES,
          disable_bev_checks=False,
@@ -220,8 +220,23 @@ def main(pkl_path: Path,
         errors.append('缺少有效 infos 列表')
         infos = []
 
+    auto_obstacles = False
+    if obstacle_classes is None:
+        obstacle_classes = set()
+    else:
+        if isinstance(obstacle_classes, list):
+            obstacle_classes = set(obstacle_classes)
+        if obstacle_classes == {AUTO_TOKEN}:
+            auto_obstacles = True
+            obstacle_classes = set()
+
     metadata = data.get('metadata', {})
     seg_class_names, seg_meta = _extract_seg_meta(metadata)
+    bbox_meta_classes = set(metadata.get('bbox2d_classes', []))
+    if auto_obstacles:
+        meta_obs = metadata.get('instance_classes') or metadata.get('gt_classes')
+        if meta_obs:
+            obstacle_classes = set(meta_obs)
     if not disable_bev_checks:
         if not seg_meta:
             errors.append('metadata 缺少 BEV/语义分割描述（期待字段如 "bev_seg" 或 "segmentation"）')
@@ -254,9 +269,10 @@ def main(pkl_path: Path,
             errors.append(f'[{idx}] gt_names 需为 numpy.ndarray；当前类型 {type(gt_names)}')
         else:
             class_counter.update(gt_names.tolist())
-            for cls in obstacle_classes:
-                if cls in gt_names:
-                    obstacle_presence[cls] += 1
+            if obstacle_classes:
+                for cls in obstacle_classes:
+                    if cls in gt_names:
+                        obstacle_presence[cls] += 1
 
         for arr_key in ['gt_velocity', 'num_lidar_pts', 'num_radar_pts', 'valid_flag']:
             arr = info.get(arr_key)
@@ -296,9 +312,6 @@ def main(pkl_path: Path,
 
     if class_counter:
         print('类别统计 Top5:', class_counter.most_common(5))
-    missing_obstacles = [cls for cls in obstacle_classes if obstacle_presence[cls] == 0]
-    if missing_obstacles:
-        print('⚠️  数据集中缺少以下障碍物类别样本：', missing_obstacles)
     if not disable_bev_checks:
         if bev_missing:
             print(f'⚠️  有 {bev_missing} 条样本缺少 BEV/语义分割信息')
@@ -309,6 +322,10 @@ def main(pkl_path: Path,
 
     if bbox_counter:
         print('2D 框类别统计 Top5:', bbox_counter.most_common(5))
+        if bbox_meta_classes:
+            missing_2d = bbox_meta_classes - set(bbox_counter.keys())
+            if missing_2d:
+                print('⚠️  2D 框缺少以下类别:', sorted(missing_2d))
 
     if reference_root is not None:
         try:
@@ -317,6 +334,11 @@ def main(pkl_path: Path,
             print(f'⚠️  参考数据统计失败：{exc}')
         else:
             print('—— WoodScape 原始数据参考 ——')
+            if auto_obstacles and not obstacle_classes:
+                inst_classes = ref_stats.get('instance', {}).get('classes')
+                if inst_classes:
+                    obstacle_classes.update(inst_classes)
+                    print('自动从原始数据加载 3D 类别，共:', len(obstacle_classes))
             if ref_stats.get('instance'):
                 inst = ref_stats['instance']
                 print(f'实例类别总数: {len(inst["classes"])}')
@@ -350,12 +372,19 @@ def main(pkl_path: Path,
                 print(f'动态掩码类别: {mot["class_names"]}')
                 print(f'动态掩码张数: {mot.get("image_count", 0)}')
 
+    if obstacle_classes:
+        missing_obstacles = [cls for cls in obstacle_classes if obstacle_presence[cls] == 0]
+        if missing_obstacles:
+            print('⚠️  数据集中缺少以下障碍物类别样本：', missing_obstacles)
+        else:
+            print('3D/实例类别覆盖完整，共 {} 类'.format(len(obstacle_classes)))
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='检查 WoodScape info 文件是否满足 Fast-BEV 多任务训练要求')
     parser.add_argument('pkl', type=Path, help='路径，例如 data/woodscape_infos_train.pkl')
-    parser.add_argument('--obstacle-classes', nargs='+', default=sorted(OBSTACLE_CLASSES),
-                        help='期望包含的 3D 障碍物类别（默认: 风险三类）')
+    parser.add_argument('--obstacle-classes', nargs='+', default=[AUTO_TOKEN],
+                        help='期望包含的 3D 障碍物类别；默认自动根据 metadata 或原始数据设置。')
     parser.add_argument('--marking-classes', nargs='+', default=sorted(ROAD_MARKING_CLASSES),
                         help='路面标志/线段类别')
     parser.add_argument('--drivable-classes', nargs='+', default=sorted(DRIVABLE_AREA_CLASSES),
@@ -368,7 +397,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(
         args.pkl,
-        obstacle_classes=set(args.obstacle_classes),
+        obstacle_classes=args.obstacle_classes,
         marking_classes=set(args.marking_classes),
         drivable_classes=set(args.drivable_classes),
         disable_bev_checks=args.skip_bev,

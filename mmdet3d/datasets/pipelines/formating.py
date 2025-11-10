@@ -55,14 +55,19 @@ class DefaultFormatBundle(object):
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
                 'gt_labels_3d', 'attr_labels', 'pts_instance_mask',
-                'pts_semantic_mask', 'centers2d', 'depths', 'gt_bev_seg'
+                'pts_semantic_mask', 'centers2d', 'depths', 'gt_bev_seg',
+                'mv_bboxes', 'mv_labels'
         ]:
             if key not in results:
                 continue
             if isinstance(results[key], list):
                 results[key] = DC([to_tensor(res) for res in results[key]])
             else:
-                results[key] = DC(to_tensor(results[key]))
+                try:
+                    results[key] = DC(to_tensor(results[key]))
+                except TypeError:
+                    print(f'[DefaultFormatBundle] key={key}, type={type(results[key])}, value={results[key]}')
+                    raise
         if 'gt_bboxes_3d' in results:
             if isinstance(results['gt_bboxes_3d'], BaseInstance3DBoxes):
                 results['gt_bboxes_3d'] = DC(
@@ -215,6 +220,28 @@ class DefaultFormatBundle3D(DefaultFormatBundle):
                 continue
             results[key] = DC(to_tensor(results[key]), stack=False)
 
+        def _ensure_numpy_labels(label_obj):
+            if isinstance(label_obj, list):
+                return [
+                    np.asarray(lbl, dtype=np.int64).reshape(-1)
+                    for lbl in label_obj
+                ]
+            label_arr = np.asarray(label_obj, dtype=np.int64)
+            if label_arr.ndim == 0:
+                label_arr = label_arr.reshape(1)
+            else:
+                label_arr = label_arr.reshape(-1)
+            return label_arr
+
+        def _normalize_names(name_obj):
+            if isinstance(name_obj, np.ndarray):
+                if name_obj.ndim == 0:
+                    return [name_obj.item()]
+                return name_obj.tolist()
+            if isinstance(name_obj, (tuple, list)):
+                return list(name_obj)
+            return [name_obj]
+
         if self.with_gt:
             # Clean GT bboxes in the final
             if 'gt_bboxes_3d_mask' in results:
@@ -232,20 +259,27 @@ class DefaultFormatBundle3D(DefaultFormatBundle):
                     results['gt_bboxes'] = results['gt_bboxes'][gt_bboxes_mask]
                 results['gt_names'] = results['gt_names'][gt_bboxes_mask]
             if self.with_label:
-                if 'gt_names' in results and len(results['gt_names']) == 0:
-                    results['gt_labels'] = np.array([], dtype=np.int64)
-                    results['attr_labels'] = np.array([], dtype=np.int64)
-                elif 'gt_names' in results and isinstance(
-                        results['gt_names'][0], list):
-                    # gt_labels might be a list of list in multi-view setting
-                    results['gt_labels'] = [
-                        np.array([self.class_names.index(n) for n in res],
-                                 dtype=np.int64) for res in results['gt_names']
-                    ]
+                if 'gt_labels' in results:
+                    results['gt_labels'] = _ensure_numpy_labels(
+                        results['gt_labels'])
                 elif 'gt_names' in results:
-                    results['gt_labels'] = np.array([
-                        self.class_names.index(n) for n in results['gt_names']
-                    ], dtype=np.int64)
+                    names = _normalize_names(results['gt_names'])
+                    if len(names) == 0:
+                        results['gt_labels'] = np.array([], dtype=np.int64)
+                        results['attr_labels'] = np.array([], dtype=np.int64)
+                    elif isinstance(names[0], list):
+                        # gt_labels might be a list of list in multi-view setting
+                        results['gt_labels'] = [
+                            np.array([self.class_names.index(n) for n in res],
+                                     dtype=np.int64) for res in names
+                        ]
+                    else:
+                        results['gt_labels'] = np.array([
+                            self.class_names.index(n) for n in names
+                        ],
+                                                         dtype=np.int64)
+                else:
+                    results['gt_labels'] = np.array([], dtype=np.int64)
                 # we still assume one pipeline for one frame LiDAR
                 # thus, the 3D name is list[string]
                 if 'gt_names_3d' in results:

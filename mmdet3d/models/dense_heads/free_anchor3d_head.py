@@ -122,6 +122,10 @@ class FreeAnchor3DHead(Anchor3DHead):
             img_meta = input_metas[img_idx] if img_idx < len(input_metas) else dict()
 
             gt_bboxes_ = gt_bboxes_.tensor.to(anchors_.device)
+            if gt_labels_.numel() == 0 or gt_bboxes_.numel() == 0:
+                box_prob.append(
+                    cls_prob_.new_zeros((anchors_.size(0), self.num_classes)))
+                continue
 
             def _align_bbox_dims_for_iou(bboxes1, bboxes2):
                 """Ensure IoU calculation uses shared box dimensions.
@@ -281,7 +285,10 @@ class FreeAnchor3DHead(Anchor3DHead):
             num_pos += len(gt_bboxes_)
             positive_losses.append(self.positive_bag_loss(matched_cls_prob, matched_box_prob))
 
-        positive_loss = torch.cat(positive_losses).sum() / max(1, num_pos)
+        if positive_losses:
+            positive_loss = torch.cat(positive_losses).sum() / max(1, num_pos)
+        else:
+            positive_loss = cls_prob.new_zeros(())
 
         # box_prob: P{a_{j} \in A_{+}}
         box_prob = torch.stack(box_prob, dim=0)

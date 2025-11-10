@@ -20,6 +20,28 @@ camera_types = [
     'CAM_BACK',
 ]
 
+point_cloud_range = [-50, -50, -5, 50, 50, 3]
+class_names = ('pedestrian', 'four-wheeler vehicle', 'two-wheeler vehicle')
+dataset_type = 'WoodScapeMultiViewDataset'
+data_root = './data/woodscape_mock/'
+bev_seg_classes = (
+    'road_surface', 'free_space',
+    'lane_marking', 'parking_line', 'other_ground_marking', 'zebra_crossing'
+)
+bbox2d_classes = ('vehicles', 'person', 'bicycle', 'traffic_light', 'traffic_sign')
+
+input_modality = dict(
+    use_lidar=False,
+    use_camera=True,
+    use_radar=False,
+    use_map=False,
+    use_external=False)
+
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53],
+    std=[58.395, 57.12, 57.375],
+    to_rgb=True)
+
 model = dict(
     type='FastBEV',
     style="v1",
@@ -32,7 +54,9 @@ model = dict(
         frozen_stages=1,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
         norm_eval=True,
-        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50'),
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='/Data/xvboxun/xbx/Fast-BEV-Fish/pretrained_models/resnet50-0676ba61.pth'),
         style='pytorch'
     ),
     neck=dict(
@@ -56,7 +80,13 @@ model = dict(
             out_channels=fuse_out_channels
         ),
         norm_cfg=dict(type='SyncBN', requires_grad=True)),
-    seg_head=None,
+    seg_head=dict(
+        type='WoodscapeBEVSegHead',
+        in_channels=256,
+        num_classes=len(bev_seg_classes),
+        mid_channels=128,
+        num_convs=2,
+        loss_seg=dict(type='CrossEntropyLoss', loss_weight=1.0)),
     bbox_head=dict(
         type='FreeAnchor3DHead',
         is_transpose=True,
@@ -71,7 +101,7 @@ model = dict(
         alpha=0.5,
         anchor_generator=dict(
             type='AlignedAnchor3DRangeGenerator',
-            ranges=[[-50, -50, -1.8, 50, 50, -1.8]],
+            ranges=[[-130, -100, -1.8, 130, 170, -1.8]],
             sizes=[
                 [0.8660, 2.5981, 1.],
                 [0.5774, 1.7321, 1.],
@@ -95,14 +125,39 @@ model = dict(
         loss_bbox=dict(type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=0.8),
         loss_dir=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.8)),
+    bbox_head_2d=dict(
+        type='FCOSHead',
+        num_classes=len(bbox2d_classes),
+        in_channels=64,
+        stacked_convs=2,
+        feat_channels=64,
+        strides=[4, 8, 16, 32],
+        regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 1e8)),
+        loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=1.0),
+        loss_bbox=dict(type='IoULoss', loss_weight=1.0),
+        loss_centerness=dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
+    train_cfg_2d=dict(
+        assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.5, neg_iou_thr=0.4, min_pos_iou=0, ignore_iof_thr=-1),
+        allowed_border=-1,
+        pos_weight=-1,
+        debug=False),
+    test_cfg_2d=dict(
+        nms_pre=1000,
+        min_bbox_size=0,
+        score_thr=0.05,
+        nms=dict(type='nms', iou_threshold=0.5),
+        max_per_img=100),
     multi_scale_id=[0],
-    n_voxels=[[250, 250, 6]],
+    n_voxels=[[650, 675, 6]],
     voxel_size=[[0.4, 0.4, 1.0]],
     fisheye_lut=dict(
         camera_model='fisheye',
         cache_dir='./work_dirs/lut_cache',
         force_rebuild=False,
-        fusion_mode='mean'
+        fusion_mode='mean',
+        intrinsic_key='intrinsics',
+        distortion_key='distortions',
+        model_key='models',
     ),
     train_cfg=dict(
         assigner=dict(
@@ -132,23 +187,6 @@ model = dict(
         nms_rescale_factor=[1.0, 0.7, 1.0],
     )
 )
-
-point_cloud_range = [-50, -50, -5, 50, 50, 3]
-class_names = ('pedestrian', 'four-wheeler vehicle', 'two-wheeler vehicle')
-dataset_type = 'WoodScapeMultiViewDataset'
-data_root = './data/woodscape_mock/'
-
-input_modality = dict(
-    use_lidar=False,
-    use_camera=True,
-    use_radar=False,
-    use_map=False,
-    use_external=False)
-
-img_norm_cfg = dict(
-    mean=[123.675, 116.28, 103.53],
-    std=[58.395, 57.12, 57.375],
-    to_rgb=True)
 
 data_config = dict(
     src_size=(640, 640),
@@ -182,15 +220,15 @@ train_pipeline = [
         type='LoadAnnotations3D',
         with_bbox_3d=True,
         with_label_3d=True,
-        with_bbox=False,
-        with_label=False,
-        with_bev_seg=False),
+        with_bbox=True,
+        with_label=True,
+        with_bev_seg=True),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
         type='Collect3D',
-        keys=['img', 'gt_bboxes_3d', 'gt_labels_3d'])
+        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_bev_seg'])
 ]
 
 test_pipeline = [
@@ -227,7 +265,7 @@ data = dict(
         load_interval=1,
         sequential=False,
         n_times=n_times,
-        with_box2d=False,
+        with_box2d=True,
         filter_empty_gt=False),
     val=dict(
         type=dataset_type,
@@ -241,7 +279,7 @@ data = dict(
         box_type_3d='LiDAR',
         sequential=False,
         n_times=n_times,
-        with_box2d=False),
+        with_box2d=True),
     test=dict(
         type=dataset_type,
         data_root=data_root,
@@ -254,8 +292,7 @@ data = dict(
         box_type_3d='LiDAR',
         sequential=False,
         n_times=n_times,
-        with_box2d=False),
-)
+        with_box2d=True))
 
 optimizer = dict(
     type='AdamW2',

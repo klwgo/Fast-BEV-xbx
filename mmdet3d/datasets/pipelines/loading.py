@@ -855,6 +855,7 @@ class LoadAnnotations3D(LoadAnnotations):
                  with_seg=False,
                  with_bbox_depth=False,
                  with_bev_seg=False,
+                 with_bbox_mv=False,
                  poly2mask=True,
                  seg_3d_dtype='int',
                  file_client_args=dict(backend='disk')):
@@ -872,6 +873,7 @@ class LoadAnnotations3D(LoadAnnotations):
         self.with_mask_3d = with_mask_3d
         self.with_seg_3d = with_seg_3d
         self.with_bev_seg = with_bev_seg
+        self.with_bbox_mv = with_bbox_mv
         self.seg_3d_dtype = seg_3d_dtype
 
     def _load_bboxes_3d(self, results):
@@ -927,7 +929,31 @@ class LoadAnnotations3D(LoadAnnotations):
     def _load_bev_seg(self, results):
         '''BEV segmentation
         '''
-        results['gt_bev_seg'] = results['ann_info']['gt_bev_seg']
+        bev_value = results['ann_info']['gt_bev_seg']
+        if isinstance(bev_value, str):
+            # 兼容将路径写在 info 中的情况，自动识别 npy 与 png。
+            if bev_value.endswith('.npy'):
+                bev_mask = np.load(bev_value)
+            else:
+                bev_mask = mmcv.imread(bev_value, flag='unchanged')
+            if bev_mask.ndim == 2:
+                bev_mask = bev_mask[np.newaxis, ...]
+            results['gt_bev_seg'] = bev_mask
+        else:
+            results['gt_bev_seg'] = bev_value
+        return results
+
+    def _load_mv_bboxes(self, results):
+        """加载多视角 2D 框与标签。"""
+        ann_info = results['ann_info']
+        mv_bboxes = ann_info.get('mv_bboxes', None)
+        mv_labels = ann_info.get('mv_labels', None)
+        if mv_bboxes is None or mv_labels is None:
+            results['mv_bboxes'] = []
+            results['mv_labels'] = []
+        else:
+            results['mv_bboxes'] = mv_bboxes
+            results['mv_labels'] = mv_labels
         return results
 
     def _load_masks_3d(self, results):
@@ -1012,6 +1038,8 @@ class LoadAnnotations3D(LoadAnnotations):
             results = self._load_semantic_seg_3d(results)
         if self.with_bev_seg:
             results = self._load_bev_seg(results)
+        if self.with_bbox_mv:
+            results = self._load_mv_bboxes(results)
 
         return results
 
