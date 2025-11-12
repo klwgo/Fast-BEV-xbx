@@ -763,7 +763,7 @@ class FastBEV(BaseDetector):
         if self.seg_head is not None:
             x_bev = self.seg_head(feature_bev)
             for idx, bev_res in enumerate(x_bev):
-                bbox_results[idx]['bev_seg'] = bev_res
+                bbox_results[idx]['bev_seg'] = bev_res.detach().cpu().numpy()
 
         if self.bbox_head_2d is not None and features_2d is not None:
             mv_results = self._simple_test_multiview_2d(features_2d, img_metas)

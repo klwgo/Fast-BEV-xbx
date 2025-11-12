@@ -80,6 +80,7 @@ SEMANTIC_ID_TO_CLASS = {
     23: 'dynamic',
     24: 'ego-vehicle',
 }
+EGO_SEMANTIC_ID = 24
 
 
 def _normalize_quaternion(quat):
@@ -154,6 +155,51 @@ def convert_bev_semantic(sem_map: np.ndarray) -> np.ndarray:
             continue
         mask[sem_map == sem_id] = BEV_CLASS_TO_ID[target]
     return mask
+
+
+def center_bev_map(sem_map: np.ndarray,
+                   ego_label: int = EGO_SEMANTIC_ID) -> np.ndarray:
+    """通过平移使 ego-vehicle 像素位于图像中心。"""
+    if sem_map.ndim > 2:
+        sem_map = sem_map.squeeze()
+    coords = np.argwhere(sem_map == ego_label)
+    if coords.size == 0:
+        return sem_map
+    target = np.array(sem_map.shape[:2], dtype=np.float32) / 2.0
+    center = coords.mean(axis=0)
+    shift = np.round(target - center).astype(int)
+    shifted = np.roll(sem_map, shift[0], axis=0)
+    shifted = np.roll(shifted, shift[1], axis=1)
+    shifted[shifted == ego_label] = 0
+    return shifted
+
+
+def rotate_bev_map(mask: np.ndarray, angle_deg: float) -> np.ndarray:
+    """旋转 BEV mask，使车辆前向对齐 Fast-BEV X 轴."""
+    if abs(angle_deg) < 1e-3:
+        return mask
+    rotated = mmcv.imrotate(
+        mask,
+        angle=angle_deg,
+        border_value=0,
+        auto_bound=True,
+        interpolation='nearest')
+    return rotated.astype(mask.dtype, copy=False)
+
+
+def align_bev_mask(mask: np.ndarray,
+                   target_shape: Optional[Tuple[int, int]] = None,
+                   flip_y: bool = True) -> np.ndarray:
+    """根据配置对齐 BEV mask 的朝向与分辨率."""
+    aligned = mask
+    if flip_y:
+        aligned = np.flip(aligned, axis=0)
+    if target_shape is not None and tuple(aligned.shape) != tuple(target_shape):
+        aligned = mmcv.imresize(
+            aligned,
+            (int(target_shape[1]), int(target_shape[0])),
+            interpolation='nearest')
+    return aligned.astype(np.uint8)
 
 
 def euler_to_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
@@ -294,7 +340,36 @@ def parse_args():
                         help='metadata 的 split 标识')
     parser.add_argument('--limit', type=int, default=None,
                         help='可选，仅处理前 N 帧用于调试')
+    parser.add_argument(
+        '--point-cloud-range',
+        type=float,
+        nargs=6,
+        default=[-130.0, -100.0, -2.0, 130.0, 170.0, 6.0],
+        metavar=('xmin', 'ymin', 'zmin', 'xmax', 'ymax', 'zmax'),
+        help='用于对齐 BEV mask 的物理范围，单位米')
+    parser.add_argument('--bev-resolution', type=float, default=0.4,
+                        help='BEV 栅格大小（米/像素），<=0 表示保持原分辨率')
+    parser.add_argument('--disable-bev-flip', dest='bev_flip_y', action='store_false',
+                        help='禁用 BEV mask 的垂直翻转')
+    parser.add_argument('--disable-bev-center', dest='bev_center', action='store_false',
+                        help='禁用 BEV mask 居中平移')
+    parser.add_argument('--disable-bev-rotate', dest='bev_rotate', action='store_false',
+                        help='禁用 BEV mask 旋转到车体坐标')
+    parser.set_defaults(bev_flip_y=True, bev_center=True, bev_rotate=True)
     return parser.parse_args()
+
+
+def _compute_bev_shape(point_cloud_range: np.ndarray,
+                       resolution: float) -> Optional[Tuple[int, int]]:
+    if resolution <= 0:
+        return None
+    span_x = float(point_cloud_range[3] - point_cloud_range[0])
+    span_y = float(point_cloud_range[4] - point_cloud_range[1])
+    if span_x <= 0 or span_y <= 0:
+        return None
+    width = max(int(round(span_x / resolution)), 1)
+    height = max(int(round(span_y / resolution)), 1)
+    return height, width
 
 
 def load_distances(path: Path):
@@ -360,6 +435,8 @@ def majority(arr):
 def main():
     args = parse_args()
     raw_root = args.raw_root
+    pc_range = np.asarray(args.point_cloud_range, dtype=np.float32)
+    bev_target_shape = _compute_bev_shape(pc_range, args.bev_resolution)
 
     calibrations = load_calibrations(raw_root / 'calibration_data')
     vehicle_root = raw_root / 'vehicle_data'
@@ -543,7 +620,19 @@ def main():
         bev_sem_path = sem_dir / f'{token}_BEV.png'
         if bev_sem_path.exists():
             bev_sem_map = mmcv.imread(bev_sem_path, flag='unchanged').astype(np.uint8)
+            if args.bev_center:
+                bev_sem_map = center_bev_map(bev_sem_map)
+            if args.bev_rotate:
+                # 将 BEV 图绕 ego yaw 旋转到车体坐标
+                quat = vehicle_pose['rotation']
+                rot = quaternion_wxyz_to_matrix(quat)
+                yaw_rad = math.atan2(rot[1, 0], rot[0, 0])
+                bev_sem_map = rotate_bev_map(bev_sem_map, angle_deg=-math.degrees(yaw_rad))
             bev_mask = convert_bev_semantic(bev_sem_map)
+            bev_mask = align_bev_mask(
+                bev_mask,
+                target_shape=bev_target_shape,
+                flip_y=args.bev_flip_y)
             np.save(bev_mask_dir / f'{token}.npy', bev_mask)
             ann_info['gt_bev_seg'] = str(bev_mask_dir / f'{token}.npy')
             if bev_mask_shape is None:

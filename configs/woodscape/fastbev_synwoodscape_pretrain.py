@@ -8,7 +8,7 @@ Fast-BEV 在 SynWoodScape 仿真数据上的预训练配置。
     - 默认指向 `data/synwoodscape_infos_*.pkl`，请在实际训练前生成相应 pkl
 """
 
-from os import environ
+import os
 
 _base_ = ['./fastbev_woodscape_fisheye.py']
 
@@ -52,13 +52,13 @@ bn_norm_cfg = dict(type='BN', requires_grad=True)
 # --------------------------------------------------------------------------- #
 # 数据路径：支持通过环境变量覆盖，便于在不同服务器间切换
 # --------------------------------------------------------------------------- #
-syn_data_root = environ.get(
+syn_data_root = os.environ.get(
     'SYN_DATA_ROOT',
     '/mnt/new_data/woodspace/synwoodscape/SynWoodScape_V0.1.1/SynWoodScape_V0.1.0/')
-syn_train_info = environ.get(
+syn_train_info = os.environ.get(
     'SYN_TRAIN_INFO',
     'data/synwoodscape_infos_train.pkl')
-syn_val_info = environ.get(
+syn_val_info = os.environ.get(
     'SYN_VAL_INFO',
     'data/synwoodscape_infos_val.pkl')
 
@@ -67,8 +67,63 @@ syn_val_info = environ.get(
 # --------------------------------------------------------------------------- #
 model = dict(
     with_cp=False,
-    bbox_head_2d=dict(num_classes=len(bbox2d_classes)),
-    seg_head=dict(num_classes=len(bev_seg_classes)),
+    bbox_head_2d=None,
+    seg_head=None,
+    bbox_head=dict(
+        pre_anchor_topk=16,
+        bbox_thr=0.4,
+        alpha=0.35,
+        pos_loss_weight=0.5,
+        neg_loss_weight=0.5,
+        assigner_per_size=True,
+        anchor_generator=dict(
+            type='AlignedAnchor3DRangeGenerator',
+            ranges=[[-130, -100, -2.0, 130, 170, 6.0]],
+            sizes=[
+                # 行人：参考均值 (0.8,0.85,1.7)，提供紧/松两个尺寸
+                [0.7, 0.8, 1.6],
+                [0.9, 1.0, 1.9],
+                # 两轮：均值 (0.8,1.46,1.46)
+                [0.7, 1.2, 1.3],
+                [0.9, 1.8, 1.6],
+                # 四轮：均值 (1.57,3.07,1.71)，覆盖小轿车到大货车
+                [1.2, 2.4, 1.6],
+                [1.6, 3.4, 1.8],
+                [2.1, 4.8, 2.1],
+                [2.6, 6.8, 2.4],
+            ],
+            custom_values=[0, 0],
+            rotations=[0, 1.57],
+            reshape_out=True),
+        # ------------------------------
+        # 强化 3D 检测分支的监督：相比默认配置放大 loss 权重，
+        # 让优化器更多关注 3D 正样本的学习，缓解 AP 长期为 0 的问题。
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=1.0),      # 降低权重，避免梯度爆炸
+        loss_bbox=dict(
+            type='SmoothL1Loss',
+            beta=1.0 / 9.0,
+            loss_weight=0.6),
+        loss_dir=dict(
+            type='CrossEntropyLoss',
+            use_sigmoid=False,
+            loss_weight=0.8)),
+    train_cfg=dict(
+        assigner=dict(
+            type='MaxIoUAssigner',
+            iou_calculator=dict(type='BboxOverlapsNearest3D'),
+            pos_iou_thr=0.35,
+            neg_iou_thr=0.3,
+            min_pos_iou=0.3,
+            ignore_iof_thr=-1),
+        allowed_border=0,
+        code_weight=[1.0] * 7 + [0.2, 0.2],
+        pos_weight=-1,
+        debug=False),
     n_voxels=[[520, 540, 6]],
     voxel_size=[[0.5, 0.5, 1.0]],
     backbone=dict(
@@ -91,26 +146,22 @@ syn_train_pipeline = [
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=file_client_args)
         ]),
-    dict(type='PrepareSynWoodscape2DTargets'),
     dict(
         type='LoadAnnotations3D',
         with_bbox_3d=True,
         with_label_3d=True,
-        with_bbox=True,
-        with_label=True,
-        with_bev_seg=True),
-    dict(type='LoadSynWoodscapeBEVSeg'),
+        with_bbox=False,
+        with_label=False,
+        with_bev_seg=False),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-dict(
+    dict(
         type='Collect3D',
-        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_bev_seg',
-              'mv_bboxes', 'mv_labels'],
+        keys=['img', 'gt_bboxes_3d', 'gt_labels_3d'],
         meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape',
-                   'scale_factor', 'lidar2img', 'img_info',
-                   'mv_bboxes', 'mv_labels', 'ann_info',
-                   'box_type_3d', 'box_mode_3d'))
+                   'scale_factor', 'lidar2img', 'img_info', 'img_norm_cfg',
+                   'ann_info', 'box_type_3d', 'box_mode_3d'))
 ]
 
 syn_test_pipeline = [
@@ -123,26 +174,22 @@ syn_test_pipeline = [
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=file_client_args)
         ]),
-    dict(type='PrepareSynWoodscape2DTargets'),
     dict(
         type='LoadAnnotations3D',
         with_bbox_3d=True,
         with_label_3d=True,
-        with_bbox=True,
-        with_label=True,
-        with_bev_seg=True),
-    dict(type='LoadSynWoodscapeBEVSeg'),
+        with_bbox=False,
+        with_label=False,
+        with_bev_seg=False),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
         type='Collect3D',
-        keys=['img', 'gt_bboxes', 'gt_labels', 'gt_bboxes_3d', 'gt_labels_3d',
-              'gt_bev_seg', 'mv_bboxes', 'mv_labels'],
+        keys=['img', 'gt_bboxes_3d', 'gt_labels_3d'],
         meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape',
-                   'scale_factor', 'lidar2img', 'img_info',
-                   'mv_bboxes', 'mv_labels', 'ann_info',
-                   'box_type_3d', 'box_mode_3d'))
+                   'scale_factor', 'lidar2img', 'img_info', 'img_norm_cfg',
+                   'ann_info', 'box_type_3d', 'box_mode_3d'))
 ]
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +206,7 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         camera_types=camera_types,
-        with_box2d=True,
+        with_box2d=False,
     ),
     val=dict(
         type=dataset_type,
@@ -169,7 +216,7 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         camera_types=camera_types,
-        with_box2d=True,
+        with_box2d=False,
     ),
     test=dict(
         type=dataset_type,
@@ -179,7 +226,7 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         camera_types=camera_types,
-        with_box2d=True,
+        with_box2d=False,
     ),
 )
 
@@ -188,19 +235,27 @@ data = dict(
 # --------------------------------------------------------------------------- #
 optimizer = dict(
     type='AdamW2',
-    lr=3e-4,
+    lr=2e-5,
+    betas=(0.95, 0.999),
     weight_decay=0.01,
     paramwise_cfg=dict(
         custom_keys={'backbone': dict(lr_mult=0.1, decay_mult=1.0)}))
-optimizer_config = dict(grad_clip=dict(max_norm=10.0, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=0.5, norm_type=2))
+
+fp16 = dict(loss_scale='dynamic')
 
 lr_config = dict(
     policy='poly',
     warmup='linear',
-    warmup_iters=2000,
+    warmup_iters=8000,
     warmup_ratio=1e-6,
     power=1.0,
-    min_lr=0,
+    min_lr=5e-7,
     by_epoch=False)
 
-evaluation = dict(interval=5, eval_2d=True, eval_3d=True, eval_bev=True, score_thr=0.0)
+runner = dict(type='EpochBasedRunner', max_epochs=40)
+total_epochs = 40
+
+evaluation = dict(interval=5, eval_2d=False, eval_3d=True, eval_bev=False, score_thr=0.0)
+
+del os

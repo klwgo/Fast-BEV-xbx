@@ -12,6 +12,7 @@ Usage example:
 
 import argparse
 import math
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,18 @@ def main():
     dataset_cfg = _select_dataset_cfg(cfg, args.split)
     dataset = build_dataset(dataset_cfg)
 
+    # Anchor 尺寸信息：用于评估 GT size 与 anchor 的匹配程度
+    anchor_sizes = None
+    try:
+        anchor_cfg = cfg.model.get('bbox_head', {}).get('anchor_generator', {})
+        sizes_cfg = anchor_cfg.get('sizes')
+        if sizes_cfg:
+            anchor_sizes = [np.asarray(size, dtype=np.float32) for size in sizes_cfg]
+    except Exception:
+        anchor_sizes = None
+    if anchor_sizes:
+        print(f'Anchor 尺寸（来自 config）：{anchor_sizes}')
+
     pc_range = np.array(cfg.get('point_cloud_range', [-math.inf, -math.inf, -math.inf,
                                                      math.inf, math.inf, math.inf]),
                         dtype=np.float32)
@@ -67,6 +80,8 @@ def main():
     outlier_records = []
     total_2d_boxes = 0
     samples_with_2d = 0
+    per_class_sizes = defaultdict(list)
+    anchor_ious = []
 
     max_iter = args.max_samples if args.max_samples > 0 else len(dataset)
     for idx in range(min(len(dataset), max_iter)):
@@ -77,6 +92,7 @@ def main():
             continue
         samples_with_boxes += 1
         centers = tensor[:, :3]
+        sizes = tensor[:, 3:6]  # 假设顺序为 (dx, dy, dz)
         mins.append(centers.min(axis=0))
         maxs.append(centers.max(axis=0))
         mask_inside = (
@@ -88,6 +104,18 @@ def main():
         outside_boxes = (~mask_inside).sum()
         outside += outside_boxes
         total_boxes += centers.shape[0]
+
+        labels = data['gt_labels_3d'].data.cpu().numpy()
+        for label, size in zip(labels, sizes):
+            per_class_sizes[int(label)].append(size)
+
+        if anchor_sizes is not None:
+            # 统计每个 GT box 与 anchor 的最佳尺寸 IoU
+            for size in sizes:
+                ious = []
+                for anchor_size in anchor_sizes:
+                    ious.append(_size_iou(size, anchor_size))
+                anchor_ious.append(max(ious))
 
         if outside_boxes > 0 and len(outlier_records) < args.dump_outliers:
             outlier_centers = centers[~mask_inside]
@@ -146,6 +174,33 @@ def main():
         print('越界样本示例:')
         for idx, centers in outlier_records:
             print(f'  - 样本 {idx} 越界 {centers.shape[0]} 个：{centers}')
+
+    if per_class_sizes:
+        print('\n按类别统计 (w, l, h)：')
+        class_names = getattr(dataset, 'CLASSES', None)
+        for cls_id, sizes in per_class_sizes.items():
+            arr = np.stack(sizes, axis=0)
+            mean = arr.mean(axis=0)
+            std = arr.std(axis=0)
+            name = class_names[cls_id] if class_names and cls_id < len(class_names) else str(cls_id)
+            print(f'  {name}: mean={mean.round(3)}, std={std.round(3)}, count={len(sizes)}')
+
+    if anchor_ious:
+        anchor_ious = np.asarray(anchor_ious)
+        print('\nAnchor 尺寸匹配统计：')
+        print(f'  平均最佳 IoU: {anchor_ious.mean():.3f}')
+        for thr in (0.3, 0.4, 0.5):
+            ratio = (anchor_ious >= thr).mean()
+            print(f'  IoU >= {thr:.1f} 的比例: {ratio:.2%}')
+
+
+def _size_iou(size_a, size_b):
+    """估算两个 3D 框尺寸之间的 IoU（忽略旋转、仅比较体积交并比）。"""
+    size_a = np.asarray(size_a)
+    size_b = np.asarray(size_b)
+    inter = np.minimum(size_a, size_b).prod()
+    union = np.maximum(size_a, size_b).prod()
+    return inter / (union + 1e-6)
 
 
 if __name__ == '__main__':
