@@ -8,6 +8,13 @@ import os
 import time
 import torch
 import warnings
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from os import path as osp

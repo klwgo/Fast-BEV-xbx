@@ -32,6 +32,8 @@ CAMERA_ORDER = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK']
 BBOX2D_SUBDIR = 'box_2d_annotations/box_2d_annotations'
 SEMANTIC_SUBDIR = 'semantic_annotations/semantic_annotations/gtLabels'
 MOTION_SUBDIR = 'motion_annotations/motion_annotations/gtLabels'
+SEMANTIC_INFO_FILE = 'semantic_annotations/seg_annotation_info.json'
+MOTION_INFO_FILE = 'motion_annotations/motion_annotation_info.json'
 BBOX2D_CLASSES = ['vehicles', 'person', 'bicycle', 'traffic_light', 'traffic_sign']
 BBOX2D_CLASS2ID = {name: idx for idx, name in enumerate(BBOX2D_CLASSES)}
 
@@ -138,6 +140,54 @@ def attach_multiview_annotations(info: dict,
     return info
 
 
+def load_semantic_metadata(raw_root: Path):
+    """读取 WoodScape 官方语义标签定义."""
+    info_path = raw_root / SEMANTIC_INFO_FILE
+    if not info_path.exists():
+        warnings.warn(f'未找到语义标签定义文件: {info_path}')
+        return None
+    try:
+        seg_meta = mmcv.load(info_path)
+    except Exception as exc:
+        warnings.warn(f'读取 {info_path} 失败: {exc}')
+        return None
+
+    class_names = list(seg_meta.get('class_names', []))
+    palette = seg_meta.get('class_colors') or seg_meta.get('palette')
+    class_indexes = seg_meta.get('class_indexes')
+    mask_shape = seg_meta.get('mask_shape')
+    if not mask_shape and class_names:
+        # WoodScape 原始语义 mask 与相机图像同分辨率(720x1280)
+        mask_shape = [720, 1280, len(class_names)]
+
+    return dict(
+        class_names=class_names,
+        palette=palette,
+        class_indexes=class_indexes,
+        mask_shape=mask_shape,
+        source='WoodScape semantic_annotations'
+    )
+
+
+def load_motion_metadata(raw_root: Path):
+    """读取 WoodScape 动态掩码类别."""
+    info_path = raw_root / MOTION_INFO_FILE
+    if not info_path.exists():
+        warnings.warn(f'未找到动态掩码定义文件: {info_path}')
+        return None
+    try:
+        motion_meta = mmcv.load(info_path)
+    except Exception as exc:
+        warnings.warn(f'读取 {info_path} 失败: {exc}')
+        return None
+
+    class_names = list(motion_meta.get('class_names', []))
+    return dict(
+        class_names=class_names,
+        source='WoodScape motion_annotations'
+    )
+
+
 def main():
     args = parse_args()
 
@@ -169,6 +219,9 @@ def main():
     else:
         warnings.warn(f'未找到 {class_info_path}，无法写入 instance_classes 元数据')
 
+    semantic_meta = load_semantic_metadata(raw_root)
+    motion_meta = load_motion_metadata(raw_root)
+
     processed_infos = []
     for info in mmcv.track_iter_progress(infos):  # 逐条样本扩充标注
         new_info = attach_multiview_annotations(
@@ -179,13 +232,19 @@ def main():
             mask_shape=args.mask_shape)
         processed_infos.append(new_info)
 
-    metadata = base.get('metadata', {})
+    metadata = dict(base.get('metadata', {}))
     metadata['split'] = args.split
-    metadata.setdefault('bev_seg', {})['class_names'] = list(args.semantic_classes)
+    metadata.setdefault('bev_seg', {})
+    metadata['bev_seg']['class_names'] = list(args.semantic_classes)
     metadata['bev_seg']['mask_shape'] = list(args.mask_shape)
+    metadata['bev_seg']['source'] = 'Fast-BEV custom BEV grid'
     metadata['bbox2d_classes'] = list(BBOX2D_CLASSES)
     if instance_classes:
         metadata['instance_classes'] = list(instance_classes)
+    if semantic_meta:
+        metadata['segmentation'] = semantic_meta
+    if motion_meta:
+        metadata['motion'] = motion_meta
 
     output = dict(metadata=metadata, infos=processed_infos)
     mmcv.dump(output, args.output)

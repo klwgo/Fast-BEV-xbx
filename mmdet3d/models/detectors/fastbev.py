@@ -36,6 +36,7 @@ class FastBEV(BaseDetector):
         seg_head,
         n_voxels,
         voxel_size,
+        multitask_head=None,
         bbox_head_2d=None,
         train_cfg=None,
         test_cfg=None,
@@ -87,6 +88,11 @@ class FastBEV(BaseDetector):
             self.seg_head = build_seg_head(seg_head)
         else:
             self.seg_head = None
+
+        if multitask_head is not None:
+            self.multitask_head = build_seg_head(multitask_head)
+        else:
+            self.multitask_head = None
 
         if bbox_head_2d is not None:
             bbox_head_2d.update(train_cfg=train_cfg_2d)
@@ -177,7 +183,14 @@ class FastBEV(BaseDetector):
             out = self.neck(x)
             return out  # [6, 64, 232, 400]; [6, 64, 116, 200]; [6, 64, 58, 100]; [6, 64, 29, 50])
 
-        if self.with_cp and x.requires_grad:
+        use_cp = False
+        if self.with_cp:
+            if torch.is_tensor(x):
+                use_cp = x.requires_grad
+            elif isinstance(x, (list, tuple)):
+                use_cp = any(torch.is_tensor(feat) and feat.requires_grad for feat in x)
+
+        if use_cp and torch.is_tensor(x):
             mlvl_feats = cp.checkpoint(_inner_forward, x)
         else:
             mlvl_feats = _inner_forward(x)
@@ -449,7 +462,15 @@ class FastBEV(BaseDetector):
             return self.forward_test(img, img_metas, **kwargs)
 
     def forward_train(
-        self, img, img_metas, gt_bboxes_3d, gt_labels_3d, gt_bev_seg=None, **kwargs
+        self,
+        img,
+        img_metas,
+        gt_bboxes=None,
+        gt_labels=None,
+        gt_bboxes_3d=None,
+        gt_labels_3d=None,
+        gt_bev_seg=None,
+        **kwargs,
     ):
         feature_bev, valids, features_2d = self.extract_feat(img, img_metas, "train")
         """
@@ -460,7 +481,43 @@ class FastBEV(BaseDetector):
         assert self.bbox_head is not None or self.seg_head is not None
 
         losses = dict()
+        base_device = None
+        if torch.is_tensor(feature_bev):
+            base_device = feature_bev.device
+        elif isinstance(feature_bev, (list, tuple)) and feature_bev:
+            first_tensor = feature_bev[0]
+            if torch.is_tensor(first_tensor):
+                base_device = first_tensor.device
+
+        def _gather_tensor(key, dtype):
+            """统一处理 DataContainer / list / numpy -> torch.Tensor."""
+            value = kwargs.get(key)
+            if value is None:
+                return None
+            if isinstance(value, DataContainer):
+                value = value.data
+            if torch.is_tensor(value):
+                tensor = value.to(device=base_device)
+            elif isinstance(value, (list, tuple)):
+                tensor_list = []
+                for item in value:
+                    if isinstance(item, DataContainer):
+                        item = item.data
+                    if not torch.is_tensor(item):
+                        item = torch.as_tensor(item)
+                    tensor_list.append(item.to(device=base_device))
+                if len(tensor_list) == 1:
+                    tensor = tensor_list[0]
+                else:
+                    tensor = torch.stack(tensor_list, dim=0)
+            else:
+                tensor = torch.as_tensor(value).to(device=base_device)
+            if dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+            return tensor
         if self.bbox_head is not None:
+            if gt_bboxes_3d is None or gt_labels_3d is None:
+                raise ValueError('gt_bboxes_3d and gt_labels_3d are required when bbox_head is enabled.')
             x = self.bbox_head(feature_bev)
             loss_det = self.bbox_head.loss(*x, gt_bboxes_3d, gt_labels_3d, img_metas)
             losses.update(loss_det)
@@ -480,6 +537,31 @@ class FastBEV(BaseDetector):
 
             loss_seg = self.seg_head.losses(x_bev, gt_bev)
             losses.update(loss_seg)
+
+        if self.multitask_head is not None:
+            multi_targets = {}
+            drivable = _gather_tensor('gt_drivable_mask', torch.long)
+            if drivable is not None:
+                multi_targets['gt_drivable_mask'] = drivable
+            marking = _gather_tensor('gt_marking_mask', torch.long)
+            if marking is not None:
+                multi_targets['gt_marking_mask'] = marking
+            boundary = _gather_tensor('gt_marking_boundary', torch.float32)
+            if boundary is not None:
+                multi_targets['gt_marking_boundary'] = boundary
+            slot = _gather_tensor('gt_slot_masks', torch.float32)
+            if slot is not None:
+                multi_targets['gt_slot_masks'] = slot
+            obstacle = _gather_tensor('gt_obstacle_mask', torch.long)
+            if obstacle is not None:
+                multi_targets['gt_obstacle_mask'] = obstacle
+            occlusion = _gather_tensor('gt_occlusion_mask', torch.float32)
+            if occlusion is not None:
+                multi_targets['gt_occlusion_mask'] = occlusion
+
+            if multi_targets:
+                preds = self.multitask_head(feature_bev)
+                losses.update(self.multitask_head.loss(preds, multi_targets))
 
         if self.bbox_head_2d is not None and features_2d is not None:
             gt_bboxes_batch = kwargs.get("gt_bboxes", [])
@@ -749,6 +831,9 @@ class FastBEV(BaseDetector):
     def simple_test(self, img, img_metas):
         bbox_results = []
         feature_bev, _, features_2d = self.extract_feat(img, img_metas, "test")
+        multitask_preds = None
+        if self.multitask_head is not None:
+            multitask_preds = self.multitask_head(feature_bev)
         if self.bbox_head is not None:
             x = self.bbox_head(feature_bev)
             bbox_list = self.bbox_head.get_bboxes(*x, img_metas, valid=None)
@@ -762,13 +847,44 @@ class FastBEV(BaseDetector):
         # BEV semantic seg
         if self.seg_head is not None:
             x_bev = self.seg_head(feature_bev)
-            for idx, bev_res in enumerate(x_bev):
-                bbox_results[idx]['bev_seg'] = bev_res.detach().cpu().numpy()
+            num_samples = len(img_metas)
+            for idx in range(num_samples):
+                bev_pred = x_bev[idx:idx + 1]
+                target_shape = None
+                ann_meta = img_metas[idx].get('ann_info')
+                if isinstance(ann_meta, (list, tuple)) and ann_meta:
+                    ann_meta = ann_meta[0]
+                if isinstance(ann_meta, dict):
+                    target_shape = ann_meta.get('bev_mask_shape')
+                if target_shape is None:
+                    target_shape = img_metas[idx].get('bev_mask_shape')
+                if target_shape is not None and len(target_shape) >= 2:
+                    target_hw = tuple(int(v) for v in target_shape[:2])
+                    bev_pred = F.interpolate(bev_pred, size=target_hw, mode='bilinear', align_corners=False)
+                bbox_results[idx]['bev_seg'] = bev_pred.squeeze(0).detach().cpu().numpy()
 
         if self.bbox_head_2d is not None and features_2d is not None:
             mv_results = self._simple_test_multiview_2d(features_2d, img_metas)
             for sample_idx, mv_res in enumerate(mv_results):
                 bbox_results[sample_idx].update(mv_res)
+
+        if multitask_preds is not None:
+            keys_map = {
+                'drivable': 'bev_drivable',
+                'marking': 'bev_marking',
+                'marking_boundary': 'bev_marking_boundary',
+                'slot': 'bev_slot',
+                'obstacle': 'bev_obstacle',
+                'occlusion': 'bev_occlusion',
+            }
+            num_samples = len(bbox_results)
+            for pred_key, result_key in keys_map.items():
+                if pred_key not in multitask_preds:
+                    continue
+                tensor = multitask_preds[pred_key]
+                for idx in range(num_samples):
+                    value = tensor[idx] if torch.is_tensor(tensor) else tensor[idx]
+                    bbox_results[idx][result_key] = value.detach().cpu().numpy()
 
         return bbox_results
 

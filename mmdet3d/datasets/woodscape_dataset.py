@@ -6,10 +6,23 @@ from typing import Dict, List, Sequence, Union
 import mmcv
 import numpy as np
 import torch
+import torch.nn.functional as F
 from mmdet.datasets import DATASETS
 
 from .nuscenes_monocular_dataset import NuScenesMultiViewDataset
 from mmdet3d.core.bbox import bbox_overlaps_nearest_3d
+from mmdet3d.datasets.pipelines.preprocess import GenerateBEVMultitaskTargets
+
+# ------------------------------------------------------------------ #
+# 兼容被 numpy>=2.0 pickle 的样本：若当前 numpy 没有 _core 模块，
+# 则为其创建别名，避免在 mmcv.load 时出现
+# `ModuleNotFoundError: No module named 'numpy._core'`.
+# ------------------------------------------------------------------ #
+if not hasattr(np, "_core") and hasattr(np, "core"):
+    import sys
+
+    sys.modules.setdefault("numpy._core", np.core)
+    np._core = np.core
 
 
 @DATASETS.register_module()
@@ -34,10 +47,16 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
                  camera_types: List[str] = None,
                  fill_identity_lidar: bool = True,
                  with_box2d: bool = False,
+                 bev_target_generator: Dict = None,
                  **kwargs):
         self.camera_types = camera_types or copy.deepcopy(self.DEFAULT_CAMERAS)
         self.fill_identity_lidar = fill_identity_lidar
         self.with_box2d = with_box2d
+        self.bev_target_generator_cfg = copy.deepcopy(bev_target_generator) if bev_target_generator else None
+        if bev_target_generator is not None:
+            self.bev_target_generator = GenerateBEVMultitaskTargets(**bev_target_generator)
+        else:
+            self.bev_target_generator = None
         if 'with_box2d' in kwargs:
             kwargs.pop('with_box2d')
         kwargs.setdefault('use_valid_flag', True)
@@ -82,37 +101,47 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             # 配置产出的 info 建议在 ann_info 中附加 bev_seg_path / motion_seg_path 等键。
             # ------------------------------------------------------------------ #
             ann_info = raw_info.get('ann_info', {})
-            if isinstance(ann_info, dict):
-                bev_seg = ann_info.get('gt_bev_seg') or ann_info.get('bev_seg_path')
-                if bev_seg is not None:
-                    info.setdefault('ann_info', {})['gt_bev_seg'] = bev_seg
-                bev_class = ann_info.get('bev_seg_classes')
-                if bev_class is not None:
-                    info.setdefault('ann_info', {})['bev_seg_classes'] = bev_class
-                bbox2d = ann_info.get('bboxes')
-                labels2d = ann_info.get('labels')
-                if bbox2d is not None and labels2d is not None:
-                    info.setdefault('ann_info', {})['mv_bboxes'] = bbox2d
-                    info['ann_info']['mv_labels'] = labels2d
-                    flat_boxes = [
-                        np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
-                        for boxes in bbox2d
-                    ]
-                    flat_labels = [
-                        np.asarray(lbls, dtype=np.int64).reshape(-1)
-                        for lbls in labels2d
-                    ]
-                    if flat_boxes:
-                        bboxes_concat = np.concatenate(flat_boxes, axis=0)
-                        labels_concat = np.concatenate(flat_labels, axis=0)
-                    else:
-                        bboxes_concat = np.zeros((0, 4), dtype=np.float32)
-                        labels_concat = np.zeros((0,), dtype=np.int64)
-                    info['ann_info']['bboxes'] = bboxes_concat
-                    info['ann_info']['labels'] = labels_concat
-                motion_path = ann_info.get('motion_seg_path')
-                if motion_path is not None:
-                    info.setdefault('ann_info', {})['motion_seg_path'] = motion_path
+            if not isinstance(ann_info, dict):
+                ann_info = {}
+            bev_seg = ann_info.get('gt_bev_seg') or ann_info.get('bev_seg_path')
+            if bev_seg is not None:
+                info.setdefault('ann_info', {})['gt_bev_seg'] = bev_seg
+            bev_class = ann_info.get('bev_seg_classes')
+            if bev_class is not None:
+                info.setdefault('ann_info', {})['bev_seg_classes'] = bev_class
+            bev_mask_shape = ann_info.get('bev_mask_shape')
+            if bev_mask_shape is not None:
+                info.setdefault('ann_info', {})['bev_mask_shape'] = bev_mask_shape
+            bbox2d = ann_info.get('bboxes')
+            labels2d = ann_info.get('labels')
+            if bbox2d is None and 'mv_bboxes' in ann_info:
+                bbox2d = ann_info.get('mv_bboxes')
+            if labels2d is None and 'mv_labels' in ann_info:
+                labels2d = ann_info.get('mv_labels')
+            if bbox2d is not None and labels2d is not None:
+                info.setdefault('ann_info', {})['mv_bboxes'] = bbox2d
+                info['ann_info']['mv_labels'] = labels2d
+            mv_bboxes_all = info.setdefault('ann_info', {}).get('mv_bboxes')
+            mv_labels_all = info['ann_info'].get('mv_labels')
+            if mv_bboxes_all is not None and mv_labels_all is not None:
+                flat_boxes = [
+                    np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+                    for boxes in mv_bboxes_all
+                ]
+                flat_labels = [
+                    np.asarray(lbls, dtype=np.int64).reshape(-1)
+                    for lbls in mv_labels_all
+                ]
+                bboxes_concat = np.concatenate(flat_boxes, axis=0) if flat_boxes else np.zeros((0, 4), dtype=np.float32)
+                labels_concat = np.concatenate(flat_labels, axis=0) if flat_labels else np.zeros((0,), dtype=np.int64)
+            else:
+                bboxes_concat = np.zeros((0, 4), dtype=np.float32)
+                labels_concat = np.zeros((0,), dtype=np.int64)
+            info.setdefault('ann_info', {})['bboxes'] = bboxes_concat
+            info['ann_info']['labels'] = labels_concat
+            motion_path = ann_info.get('motion_seg_path')
+            if motion_path is not None:
+                info.setdefault('ann_info', {})['motion_seg_path'] = motion_path
 
             processed.append(info)
 
@@ -134,13 +163,22 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
         if mv_bboxes is not None and mv_labels is not None:
             ann['mv_bboxes'] = mv_bboxes
             ann['mv_labels'] = mv_labels
+
+        bboxes = copy.deepcopy(src_ann.get('bboxes'))
+        labels = copy.deepcopy(src_ann.get('labels'))
+        if bboxes is not None and labels is not None:
+            ann['bboxes'] = bboxes
+            ann['labels'] = labels
+        else:
+            ann.setdefault('bboxes', np.zeros((0, 4), dtype=np.float32))
+            ann.setdefault('labels', np.zeros((0,), dtype=np.int64))
             info['mv_bboxes'] = copy.deepcopy(mv_bboxes)
             info['mv_labels'] = copy.deepcopy(mv_labels)
 
         # 拷贝关键 3D/BEV 标注，保证 test_mode 下也能加载
         full_ann = self.get_ann_info(index)
         if isinstance(full_ann, dict):
-            for key in ['gt_bboxes_3d', 'gt_labels_3d', 'gt_bev_seg', 'bev_seg_classes']:
+            for key in ['gt_bboxes_3d', 'gt_labels_3d', 'gt_bev_seg', 'bev_seg_classes', 'bev_mask_shape']:
                 if key in full_ann:
                     ann[key] = copy.deepcopy(full_ann[key])
 
@@ -280,28 +318,23 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             dict: 包含各类别 AP 以及 mean AP。
         """
         if metric is None:
-            metric = ('mAP', )
-        if isinstance(metric, str):
+            metric = tuple()
+        elif isinstance(metric, str):
             metric = (metric, )
-        allowed_metrics = {'mAP'}
+        allowed_metrics = {'mAP', 'bev', 'bev_seg', 'bev_multitask', '2d'}
         for m in metric:
             if m not in allowed_metrics:
                 raise KeyError(f'不支持的评价指标: {m}')
+
+        eval_3d = eval_3d or ('mAP' in metric)
+        eval_bev = eval_bev or any(m in ('bev', 'bev_seg', 'bev_multitask') for m in metric)
+        eval_2d = eval_2d or ('2d' in metric)
 
         assert len(results) == len(self), \
             f'结果数量 {len(results)} 与数据集大小 {len(self)} 不一致'
 
         eval_results = {}
         if eval_3d:
-            if metric is None:
-                metric = ('mAP', )
-            if isinstance(metric, str):
-                metric = (metric, )
-            allowed_metrics = {'mAP'}
-            for m in metric:
-                if m not in allowed_metrics:
-                    raise KeyError(f'不支持的评价指标: {m}')
-
             num_classes = len(self.CLASSES)
             gt_counter = [0] * num_classes
             per_cls_scores = [[] for _ in range(num_classes)]
@@ -411,6 +444,10 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             bev_results = self._evaluate_bev_seg(results)
             eval_results.update(bev_results)
 
+        if self.bev_target_generator is not None:
+            multitask_results = self._evaluate_bev_multitask(results)
+            eval_results.update(multitask_results)
+
         if logger is not None:
             if eval_3d:
                 logger.info('WoodScape evaluation (IoU {:.2f}): {}'.format(
@@ -444,6 +481,11 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
         if bboxes is not None and labels is not None:
             base_info['bboxes'] = bboxes
             base_info['labels'] = labels
+        else:
+            if 'bboxes' not in base_info:
+                base_info['bboxes'] = np.zeros((0, 4), dtype=np.float32)
+            if 'labels' not in base_info:
+                base_info['labels'] = np.zeros((0,), dtype=np.int64)
 
         motion_seg = ann_info.get('motion_seg_path')
         if motion_seg is not None:
@@ -567,8 +609,17 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             gt_mask = self._load_bev_mask(gt_ann.get('gt_bev_seg'))
             if gt_mask is None:
                 continue
+            if gt_mask.ndim == 3 and gt_mask.shape[-1] == num_classes:
+                gt_mask = gt_mask.argmax(axis=-1)
             if gt_mask.shape != pred_arr.shape:
-                continue
+                target_hw = (gt_mask.shape[1], gt_mask.shape[0])
+                resized = mmcv.imresize(
+                    pred_arr.astype(np.float32),
+                    target_hw,
+                    interpolation='nearest')
+                pred_arr = np.rint(resized).astype(pred_arr.dtype)
+                if pred_arr.shape != gt_mask.shape:
+                    continue
 
             for cls_idx in range(num_classes):
                 gt_cls = gt_mask == cls_idx
@@ -586,6 +637,291 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             bev_results[f'IoU_bev_{cls_name}'] = float(ious[cls_idx])
         bev_results['mIoU_bev'] = float(np.mean(ious)) if intersection.sum() > 0 else float('nan')
         return bev_results
+
+    def _evaluate_bev_multitask(self, results: List[dict]):
+        """Evaluate新增三项 BEV 多任务指标."""
+        metrics = {}
+        if not results:
+            return metrics
+        if any('bev_drivable' in res for res in results):
+            metrics.update(self._evaluate_drivable(results))
+        if any('bev_marking' in res for res in results):
+            metrics.update(self._evaluate_marking(results))
+        if any('bev_marking_boundary' in res for res in results):
+            metrics.update(self._evaluate_boundary(results))
+        if any('bev_slot' in res for res in results):
+            metrics.update(self._evaluate_slot(results))
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is not None:
+            if getattr(generator, 'enable_obstacle', False) and any('bev_obstacle' in r for r in results):
+                metrics.update(self._evaluate_obstacle(results))
+            if getattr(generator, 'enable_occlusion', False) and any('bev_occlusion' in r for r in results):
+                metrics.update(self._evaluate_occlusion(results))
+        return metrics
+
+    def _evaluate_drivable(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None:
+            return {}
+        num_classes = len(generator.drivable_class_names)
+        intersection = np.zeros(num_classes, dtype=np.float64)
+        union = np.zeros(num_classes, dtype=np.float64)
+
+        for idx, result in enumerate(results):
+            pred = result.get('bev_drivable')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_mask = targets.get('gt_drivable_mask')
+            if gt_mask is None:
+                continue
+            pred_arr = self._resize_logits(np.asarray(pred), gt_mask.shape)
+            pred_cls = pred_arr.argmax(axis=0)
+            for cls_idx in range(num_classes):
+                gt_cls = gt_mask == cls_idx
+                pred_cls_mask = pred_cls == cls_idx
+                union_val = np.logical_or(gt_cls, pred_cls_mask).sum()
+                if union_val == 0:
+                    continue
+                intersection[cls_idx] += np.logical_and(gt_cls, pred_cls_mask).sum()
+                union[cls_idx] += union_val
+
+        eps = 1e-12
+        ious = intersection / np.maximum(union, eps)
+        metrics = {}
+        for cls_idx, cls_name in enumerate(generator.drivable_class_names):
+            metrics[f'IoU_drivable_{cls_name}'] = float(ious[cls_idx])
+        metrics['mIoU_drivable'] = float(np.mean(ious)) if union.sum() > 0 else float('nan')
+        return metrics
+
+    def _evaluate_marking(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None:
+            return {}
+        class_names = ['background'] + list(generator.marking_classes)
+        num_classes = len(class_names)
+        intersection = np.zeros(num_classes, dtype=np.float64)
+        union = np.zeros(num_classes, dtype=np.float64)
+
+        for idx, result in enumerate(results):
+            pred = result.get('bev_marking')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_mask = targets.get('gt_marking_mask')
+            if gt_mask is None:
+                continue
+            pred_arr = self._resize_logits(np.asarray(pred), gt_mask.shape)
+            pred_cls = pred_arr.argmax(axis=0)
+            for cls_idx in range(num_classes):
+                gt_cls = gt_mask == cls_idx
+                pred_cls_mask = pred_cls == cls_idx
+                union_val = np.logical_or(gt_cls, pred_cls_mask).sum()
+                if union_val == 0:
+                    continue
+                intersection[cls_idx] += np.logical_and(gt_cls, pred_cls_mask).sum()
+                union[cls_idx] += union_val
+
+        eps = 1e-12
+        ious = intersection / np.maximum(union, eps)
+        metrics = {}
+        for cls_idx, cls_name in enumerate(class_names):
+            metrics[f'IoU_marking_{cls_name}'] = float(ious[cls_idx])
+        metrics['mIoU_marking'] = float(np.mean(ious)) if union.sum() > 0 else float('nan')
+        return metrics
+
+    def _evaluate_boundary(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None:
+            return {}
+        tp = fp = fn = 0
+        for idx, result in enumerate(results):
+            pred = result.get('bev_marking_boundary')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_mask = targets.get('gt_marking_boundary')
+            if gt_mask is None:
+                continue
+            pred_arr = np.asarray(pred)
+            pred_arr = self._resize_logits(pred_arr, gt_mask.shape)
+            prob = self._sigmoid_numpy(pred_arr)
+            pred_mask = prob > 0.5
+            gt_bool = gt_mask.astype(bool)
+            tp += np.logical_and(pred_mask, gt_bool).sum()
+            fp += np.logical_and(pred_mask, np.logical_not(gt_bool)).sum()
+            fn += np.logical_and(np.logical_not(pred_mask), gt_bool).sum()
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        return dict(
+            Precision_marking_boundary=float(precision),
+            Recall_marking_boundary=float(recall),
+            F1_marking_boundary=float(f1),
+        )
+
+    def _evaluate_slot(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None:
+            return {}
+        channel_names = list(generator.slot_channel_names)
+        num_channels = len(channel_names)
+        intersection = np.zeros(num_channels, dtype=np.float64)
+        union = np.zeros(num_channels, dtype=np.float64)
+
+        for idx, result in enumerate(results):
+            pred = result.get('bev_slot')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_slot = targets.get('gt_slot_masks')
+            if gt_slot is None:
+                continue
+            pred_arr = np.asarray(pred)
+            pred_arr = self._resize_logits(pred_arr, gt_slot.shape[-2:])
+            prob = self._sigmoid_numpy(pred_arr)
+            pred_mask = prob > 0.5
+            for ch in range(num_channels):
+                gt_mask = gt_slot[ch].astype(bool)
+                pred_ch = pred_mask[ch]
+                union_val = np.logical_or(gt_mask, pred_ch).sum()
+                if union_val == 0:
+                    continue
+                intersection[ch] += np.logical_and(gt_mask, pred_ch).sum()
+                union[ch] += union_val
+
+        eps = 1e-12
+        ious = intersection / np.maximum(union, eps)
+        metrics = {}
+        for ch, name in enumerate(channel_names):
+            metrics[f'IoU_slot_{name}'] = float(ious[ch])
+        metrics['mIoU_slot'] = float(np.mean(ious)) if union.sum() > 0 else float('nan')
+        return metrics
+
+    def _evaluate_obstacle(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None or not getattr(generator, 'enable_obstacle', False):
+            return {}
+        class_names = ['background'] + list(generator.obstacle_class_names)
+        num_classes = len(class_names)
+        intersection = np.zeros(num_classes, dtype=np.float64)
+        union = np.zeros(num_classes, dtype=np.float64)
+        for idx, result in enumerate(results):
+            pred = result.get('bev_obstacle')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_mask = targets.get('gt_obstacle_mask')
+            if gt_mask is None:
+                continue
+            pred_arr = np.asarray(pred)
+            pred_arr = self._resize_logits(pred_arr, gt_mask.shape)
+            if pred_arr.ndim == 3:
+                pred_cls = pred_arr.argmax(axis=0)
+            else:
+                pred_cls = pred_arr
+            for cls_idx in range(num_classes):
+                gt_cls = gt_mask == cls_idx
+                pred_cls_mask = pred_cls == cls_idx
+                union_val = np.logical_or(gt_cls, pred_cls_mask).sum()
+                if union_val == 0:
+                    continue
+                intersection[cls_idx] += np.logical_and(gt_cls, pred_cls_mask).sum()
+                union[cls_idx] += union_val
+        eps = 1e-12
+        ious = intersection / np.maximum(union, eps)
+        metrics = {}
+        for cls_idx, cls_name in enumerate(class_names):
+            metrics[f'IoU_obstacle_{cls_name}'] = float(ious[cls_idx])
+        metrics['mIoU_obstacle'] = float(np.mean(ious)) if union.sum() > 0 else float('nan')
+        return metrics
+
+    def _evaluate_occlusion(self, results: List[dict]):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None or not getattr(generator, 'enable_occlusion', False):
+            return {}
+        tp = fp = fn = tn = 0
+        for idx, result in enumerate(results):
+            pred = result.get('bev_occlusion')
+            if pred is None:
+                continue
+            gt_ann = self.get_ann_info(idx)
+            targets = self._prepare_bev_targets(gt_ann)
+            if not targets:
+                continue
+            gt_mask = targets.get('gt_occlusion_mask')
+            if gt_mask is None:
+                continue
+            pred_arr = np.asarray(pred)
+            pred_arr = self._resize_logits(pred_arr, gt_mask.shape)
+            prob = self._sigmoid_numpy(pred_arr)
+            pred_mask = prob > 0.5
+            gt_bool = gt_mask.astype(bool)
+            tp += np.logical_and(pred_mask, gt_bool).sum()
+            fp += np.logical_and(pred_mask, np.logical_not(gt_bool)).sum()
+            fn += np.logical_and(np.logical_not(pred_mask), gt_bool).sum()
+            tn += np.logical_and(np.logical_not(pred_mask), np.logical_not(gt_bool)).sum()
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        iou = tp / max(tp + fp + fn, 1)
+        acc = (tp + tn) / max(tp + tn + fp + fn, 1)
+        return dict(
+            Precision_occlusion=float(precision),
+            Recall_occlusion=float(recall),
+            F1_occlusion=float(f1),
+            IoU_occlusion=float(iou),
+            Acc_occlusion=float(acc),
+        )
+
+    def _prepare_bev_targets(self, ann_info: Dict):
+        generator = getattr(self, 'bev_target_generator', None)
+        if generator is None:
+            return None
+        bev_mask = self._load_bev_mask(ann_info.get('gt_bev_seg'))
+        if bev_mask is None:
+            return None
+        bev_classes = ann_info.get('bev_seg_classes', [])
+        dummy_results = dict(ann_info=ann_info)
+        return generator.build_targets(dummy_results, bev_mask, bev_classes)
+
+    @staticmethod
+    def _resize_logits(pred_arr, target_shape):
+        arr = np.asarray(pred_arr)
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, ...]
+            squeeze = True
+        else:
+            squeeze = False
+        if arr.shape[-2:] == target_shape:
+            return arr[0] if squeeze else arr
+        tensor = torch.from_numpy(arr).unsqueeze(0).float()
+        tensor = F.interpolate(tensor, size=target_shape, mode='bilinear', align_corners=False)
+        tensor = tensor.squeeze(0).numpy()
+        if squeeze:
+            return tensor[0]
+        return tensor
+
+    @staticmethod
+    def _sigmoid_numpy(x):
+        x = np.clip(x, -50, 50)
+        return 1.0 / (1.0 + np.exp(-x))
 
     @staticmethod
     def _load_bev_mask(mask):

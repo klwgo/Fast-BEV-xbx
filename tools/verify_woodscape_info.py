@@ -172,16 +172,25 @@ def _load_reference_stats(root: Path):
 def _extract_seg_meta(metadata):
     if not isinstance(metadata, dict):
         return set(), None
-    possible_keys = ['bev_seg', 'segmentation', 'bev_segmentation', 'map_seg']
+    possible_keys = ['segmentation', 'bev_seg', 'bev_segmentation', 'map_seg']
+    collected = []
     for key in possible_keys:
         seg = metadata.get(key)
-        if not isinstance(seg, dict):
-            continue
+        if isinstance(seg, dict):
+            collected.append(seg)
+
+    class_names = set()
+    primary_seg = None
+    for seg in collected:
         for name_key in ['class_names', 'classes', 'labels']:
             names = seg.get(name_key)
             if isinstance(names, (list, tuple)):
-                return set(names), seg
-    return set(), None
+                class_names.update(names)
+                if primary_seg is None:
+                    primary_seg = seg
+                break
+
+    return class_names, primary_seg
 
 
 def _has_bev_seg(info):

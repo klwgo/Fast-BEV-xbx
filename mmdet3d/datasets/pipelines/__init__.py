@@ -8,7 +8,8 @@ from .loading import (LoadAnnotations3D, LoadImageFromFileMono3D,
                       PointSegClassMapping, LoadMultiViewImageFromFilesV2)
 from .preprocess import (PrepareSynWoodscape2DTargets,
                          EnsureSynWoodscape3DTargets,
-                         LoadSynWoodscapeBEVSeg)
+                         LoadSynWoodscapeBEVSeg,
+                         GenerateBEVMultitaskTargets)
 from .test_time_aug import MultiScaleFlipAug3D
 from .transforms_3d import (BackgroundPointsFilter, GlobalAlignment,
                             GlobalRotScaleTrans, IndoorPatchPointSample,
@@ -34,5 +35,5 @@ __all__ = [
     'LoadImageFromFileMono3D', 'ObjectNameFilter', 'RandomDropPointsColor',
     'RandomJitterPoints', 'LoadMultiViewImageFromFilesV2',
     'PrepareSynWoodscape2DTargets', 'EnsureSynWoodscape3DTargets',
-    'LoadSynWoodscapeBEVSeg'
+    'LoadSynWoodscapeBEVSeg', 'GenerateBEVMultitaskTargets'
 ]

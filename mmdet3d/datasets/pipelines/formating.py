@@ -56,7 +56,9 @@ class DefaultFormatBundle(object):
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
                 'gt_labels_3d', 'attr_labels', 'pts_instance_mask',
                 'pts_semantic_mask', 'centers2d', 'depths', 'gt_bev_seg',
-                'mv_bboxes', 'mv_labels'
+                'mv_bboxes', 'mv_labels', 'gt_drivable_mask',
+                'gt_marking_mask', 'gt_marking_boundary', 'gt_slot_masks',
+                'gt_obstacle_mask', 'gt_occlusion_mask'
         ]:
             if key not in results:
                 continue
