@@ -23,6 +23,13 @@ img_norm_cfg = dict(mean=[123.675, 116.28, 103.53],
                     to_rgb=True)
 num_views = 4
 n_times = 1
+dataset_type = 'WoodScapeMultiViewDataset'
+input_modality = dict(
+    use_lidar=False,
+    use_camera=True,
+    use_radar=False,
+    use_map=False,
+    use_external=False)
 
 # --------------------------------------------------------------------------- #
 # 数据路径 / 类别定义
@@ -70,6 +77,11 @@ train_pipeline = [
         with_bbox=True,
         with_label=True,
         with_bev_seg=True),
+    dict(type='PhotoMetricDistortionMultiViewImage'),
+    dict(
+        type='RandomScaleImageMultiViewImage',
+        scales=[0.9, 1.1],
+        scale_type='interval'),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),
     dict(
@@ -117,13 +129,13 @@ model = dict(
         refine_head=True,
         loss_seg=dict(
             type='CrossEntropyLoss',
-            class_weight=[9.0, 11.0, 8.0, 8.0, 6.0, 0.5],
+            class_weight=[8.0, 10.0, 9.5, 9.5, 7.0, 1.0],
             loss_weight=0.8),
         loss_aux=dict(
             type='DiceLoss',
             reduction='mean',
             loss_weight=0.25),
-        loss_aux_class_weight=[9.0, 11.0, 8.0, 8.0, 6.0, 0.5],
+        loss_aux_class_weight=[8.0, 10.0, 9.5, 9.5, 7.0, 1.0],
         binary_aux_losses=[
             dict(
                 class_index=2,
@@ -136,13 +148,13 @@ model = dict(
                 ignore_index=255,
                 loss_name='veg_aux',
                 loss_weight=0.06,
-                pos_weight=2.0),
+                pos_weight=2.5),
             dict(
                 class_index=4,
                 ignore_index=255,
                 loss_name='ground_aux',
                 loss_weight=0.06,
-                pos_weight=2.0),
+                pos_weight=2.5),
         ]),
     bbox_head_2d=dict(num_classes=len(bbox2d_classes)),
 )
@@ -154,13 +166,24 @@ data = dict(
     samples_per_gpu=1,
     workers_per_gpu=1,
     train=dict(
-        data_root=syn_data_root,
-        ann_file=syn_train_info,
-        classes=class_names,
-        camera_types=camera_types,
-        pipeline=train_pipeline,
-        with_box2d=True,
-    ),
+        type='ClassBalancedDataset',
+        oversample_thr=0.015,
+        dataset=dict(
+            type=dataset_type,
+            data_root=syn_data_root,
+            ann_file=syn_train_info,
+            classes=class_names,
+            camera_types=camera_types,
+            pipeline=train_pipeline,
+            modality=input_modality,
+            test_mode=False,
+            box_type_3d='LiDAR',
+            load_interval=1,
+            sequential=False,
+            n_times=n_times,
+            with_box2d=True,
+            filter_empty_gt=False,
+        )),
     val=dict(
         data_root=syn_data_root,
         ann_file=syn_val_info,
@@ -209,7 +232,7 @@ custom_hooks = [
         module_attr='seg_head',
         warmup_iters=4000,
         start_scale=0.3,
-        end_scale=0.8,
+        end_scale=0.6,
     )
 ]
 

@@ -478,7 +478,11 @@ class FastBEV(BaseDetector):
         valids: (1, 1, 200, 200, 12)
         features_2d: [[6, 64, 232, 400], [6, 64, 116, 200], [6, 64, 58, 100], [6, 64, 29, 50]]
         """
-        assert self.bbox_head is not None or self.seg_head is not None
+        assert (
+            self.bbox_head is not None
+            or self.seg_head is not None
+            or self.multitask_head is not None
+        ), 'At least one head (bbox/seg/multitask) must be defined for training.'
 
         losses = dict()
         base_device = None
@@ -514,6 +518,9 @@ class FastBEV(BaseDetector):
                 tensor = torch.as_tensor(value).to(device=base_device)
             if dtype is not None:
                 tensor = tensor.to(dtype=dtype)
+            # 保证存在 batch 维，否则 CrossEntropy 会将 H 视为 batch
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0)
             return tensor
         if self.bbox_head is not None:
             if gt_bboxes_3d is None or gt_labels_3d is None:

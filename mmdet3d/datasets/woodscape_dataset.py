@@ -321,7 +321,10 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             metric = tuple()
         elif isinstance(metric, str):
             metric = (metric, )
-        allowed_metrics = {'mAP', 'bev', 'bev_seg', 'bev_multitask', '2d'}
+        allowed_metrics = {
+            'mAP', 'bev', 'bev_seg', 'bev_multitask', '2d',
+            'headA', 'headB', 'headC'
+        }
         for m in metric:
             if m not in allowed_metrics:
                 raise KeyError(f'不支持的评价指标: {m}')
@@ -334,6 +337,11 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             f'结果数量 {len(results)} 与数据集大小 {len(self)} 不一致'
 
         eval_results = {}
+
+        def _prefix_metrics(prefix, metrics_dict):
+            if not metrics_dict:
+                return {}
+            return {f'{prefix}_{k}': v for k, v in metrics_dict.items()}
         if eval_3d:
             num_classes = len(self.CLASSES)
             gt_counter = [0] * num_classes
@@ -440,6 +448,12 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             two_d_results = self._evaluate_multiview_bbox(results, score_thr=score_thr)
             eval_results.update(two_d_results)
 
+        head_metrics_requested = {
+            'headA': 'headA' in metric,
+            'headB': 'headB' in metric,
+            'headC': 'headC' in metric,
+        }
+
         if eval_bev:
             bev_results = self._evaluate_bev_seg(results)
             eval_results.update(bev_results)
@@ -447,6 +461,16 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
         if self.bev_target_generator is not None:
             multitask_results = self._evaluate_bev_multitask(results)
             eval_results.update(multitask_results)
+
+            if head_metrics_requested['headA']:
+                eval_results.update(_prefix_metrics('HeadA', self._evaluate_drivable(results)))
+            if head_metrics_requested['headB']:
+                eval_results.update(_prefix_metrics('HeadB', self._evaluate_marking(results)))
+                boundary_metrics = self._evaluate_boundary(results)
+                if boundary_metrics:
+                    eval_results.update(_prefix_metrics('HeadB_Boundary', boundary_metrics))
+            if head_metrics_requested['headC']:
+                eval_results.update(_prefix_metrics('HeadC', self._evaluate_slot(results)))
 
         if logger is not None:
             if eval_3d:

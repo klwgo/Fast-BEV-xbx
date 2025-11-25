@@ -184,8 +184,8 @@ class GenerateBEVMultitaskTargets:
         self.ignore_index = ignore_index
         self.drivable_class_names = list(drivable_class_names or (
             'non_drivable', 'drivable', 'uncertain'))
-        if len(self.drivable_class_names) != 3:
-            raise ValueError('drivable_class_names 必须包含 3 个条目')
+        if len(self.drivable_class_names) < 2:
+            raise ValueError('drivable_class_names 至少包含 2 个条目')
         self.slot_channel_names = list(slot_channel_names or (
             'slot_line', 'slot_endpoint'))
         self.slot_channels = len(self.slot_channel_names)

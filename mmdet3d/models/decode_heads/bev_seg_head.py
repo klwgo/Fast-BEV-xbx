@@ -229,11 +229,15 @@ class _BinarySegLoss(nn.Module):
 
     def __init__(self, loss_weight=1.0, pos_weight=None):
         super().__init__()
-        self.loss_weight = loss_weight
+        self.base_loss_weight = float(loss_weight)
+        self.loss_weight = float(loss_weight)
         if pos_weight is not None:
-            self.register_buffer('pos_weight', torch.tensor(pos_weight, dtype=torch.float32))
+            pos_tensor = torch.tensor(pos_weight, dtype=torch.float32)
+            self.register_buffer('pos_weight', pos_tensor.clone())
+            self.register_buffer('base_pos_weight', pos_tensor.clone())
         else:
             self.pos_weight = None
+            self.base_pos_weight = None
 
     def forward(self, logits, target):
         if logits.numel() == 0:
@@ -245,5 +249,7 @@ class _BinarySegLoss(nn.Module):
         return loss * self.loss_weight
 
     def set_class_weight_scale(self, scale: float):
-        if self.pos_weight is not None:
-            self.pos_weight.mul_(scale)
+        self.loss_weight = self.base_loss_weight * scale
+        if self.pos_weight is not None and self.base_pos_weight is not None:
+            scaled = self.base_pos_weight * scale
+            self.pos_weight.copy_(scaled)

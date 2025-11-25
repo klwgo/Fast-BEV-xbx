@@ -1293,6 +1293,52 @@ class RandomScaleImageMultiViewImage(object):
         # exit()
         return results
 
+
+@PIPELINES.register_module()
+class RandomCropImageMultiViewImage(object):
+    """Random crop multiview images and adjust lidar2img translation.
+
+    Note: 仅调整图像与平移项，裁剪比例过大可能造成视野缺失。
+    """
+
+    def __init__(self, min_crop_ratio=0.7, max_crop_ratio=1.0):
+        assert 0 < min_crop_ratio <= max_crop_ratio <= 1.0
+        self.min_crop_ratio = min_crop_ratio
+        self.max_crop_ratio = max_crop_ratio
+
+    def __call__(self, results):
+        img_shape = results['img_shape']
+        # img_shape 可能是 (H,W,3) 或每视角形状列表，这里取第一个视角的 H,W
+        if isinstance(img_shape, (list, tuple)) and len(img_shape) > 0 and isinstance(img_shape[0], (list, tuple)):
+            h0, w0 = img_shape[0][0], img_shape[0][1]
+        else:
+            h0, w0 = img_shape[0], img_shape[1]
+        ratio = np.random.uniform(self.min_crop_ratio, self.max_crop_ratio)
+        new_h = int(h0 * ratio)
+        new_w = int(w0 * ratio)
+        if new_h <= 0 or new_w <= 0:
+            return results
+        max_y = h0 - new_h
+        max_x = w0 - new_w
+        y0 = np.random.randint(0, max_y + 1) if max_y > 0 else 0
+        x0 = np.random.randint(0, max_x + 1) if max_x > 0 else 0
+
+        cropped_imgs = []
+        for img in results['img']:
+            cropped_imgs.append(img[y0:y0 + new_h, x0:x0 + new_w])
+        results['img'] = cropped_imgs
+        results['img_shape'] = [img.shape for img in results['img']]
+
+        trans = np.eye(4, dtype=np.float32)
+        trans[0, 3] -= x0
+        trans[1, 3] -= y0
+        results['lidar2img']['extrinsic'] = [trans @ l2i for l2i in results['lidar2img']['extrinsic']]
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(min_crop_ratio={self.min_crop_ratio}, '
+                f'max_crop_ratio={self.max_crop_ratio})')
+
     def __repr__(self):
         repr_str = self.__class__.__name__
         repr_str += f'(size={self.scales}, '
