@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmcv.cnn import kaiming_init
+from mmcv.cnn import ConvModule
 from mmcv.runner import BaseModule
 from mmdet.models import build_loss
 from mmdet.models.builder import HEADS
@@ -47,6 +48,91 @@ class _MaskedLoss(nn.Module):
         if self.reduction == 'sum':
             return loss.sum()
         return loss
+
+
+class _SigmoidFocalLoss(nn.Module):
+    """Simplified sigmoid focal loss, supports arbitrary shape, reduction handled here."""
+
+    def __init__(self, gamma=2.0, alpha=0.25, reduction='none'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        # pred/target same shape
+        prob = torch.sigmoid(pred)
+        pt = target * prob + (1 - target) * (1 - prob)
+        alpha_t = target * self.alpha + (1 - target) * (1 - self.alpha)
+        focal = alpha_t * torch.pow(1 - pt, self.gamma)
+        bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        loss = focal * bce
+        if self.reduction == 'mean':
+            return loss.mean()
+        if self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation for channel attention."""
+
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        mid = max(channels // reduction, 1)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        w = self.fc(x)
+        return x * w
+
+
+class ASPPModule(nn.Module):
+    """简单 ASPP，用多尺度空洞卷积汇聚上下文。"""
+
+    def __init__(self, in_channels, out_channels, dilations=(1, 3, 6)):
+        super().__init__()
+        self.branches = nn.ModuleList()
+        for d in dilations:
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, 3, padding=d, dilation=d, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True),
+                )
+            )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_channels * len(dilations), out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        feats = [b(x) for b in self.branches]
+        return self.fuse(torch.cat(feats, dim=1))
+
+
+class SpatialAttention(nn.Module):
+    """空间注意力，强调显著区域。"""
+
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn = self.conv(torch.cat([avg_out, max_out], dim=1))
+        attn = self.sigmoid(attn)
+        return x * attn
 
 
 def _dice_loss(logits,
@@ -93,7 +179,11 @@ def _build_loss_module(cfg, default_type=None):
     loss_type = loss_cfg.pop('type', default_type)
     if loss_type in (None,):
         return None
+    # 兼容 class_weight 写法
+    class_weight = loss_cfg.pop('class_weight', None)
     weight = loss_cfg.get('weight')
+    if weight is None and class_weight is not None:
+        weight = class_weight
     if isinstance(weight, (list, tuple)):
         loss_cfg['weight'] = torch.tensor(weight, dtype=torch.float32)
     if 'pos_weight' in loss_cfg:
@@ -108,7 +198,16 @@ def _build_loss_module(cfg, default_type=None):
         # weight 用于外部 class_weight，避免传入 criterion
         loss_cfg.pop('weight', None)
     if loss_type == 'BCEWithLogitsLoss':
+        # 清理不属于 BCE 的多余参数（如 gamma/alpha）避免构造报错
+        loss_cfg.pop('gamma', None)
+        loss_cfg.pop('alpha', None)
         return _WeightedLoss(nn.BCEWithLogitsLoss(**loss_cfg), loss_weight)
+    if loss_type == 'SigmoidFocalLoss':
+        gamma = loss_cfg.pop('gamma', 2.0)
+        alpha = loss_cfg.pop('alpha', 0.25)
+        reduction = loss_cfg.pop('reduction', 'none')
+        return _WeightedLoss(_SigmoidFocalLoss(gamma=gamma, alpha=alpha, reduction=reduction),
+                             loss_weight)
     if loss_type == 'MSELoss':
         return _WeightedLoss(nn.MSELoss(**loss_cfg), loss_weight)
     if loss_type == 'CrossEntropyLoss':
@@ -157,7 +256,11 @@ class FisheyeBEVMultiTaskHead(BaseModule):
                  balance_drivable=False,
                  balance_marking=True,
                  balance_obstacle=False,
-                 max_balance_factor=200.0):
+                 max_balance_factor=200.0,
+                 marking_dilate_kernel=3,
+                 marking_dice_weight=2.0,
+                 drivable_dilate_kernel=None,
+                 use_simple_drivable=False):
         super().__init__()
         enable_heads = enable_heads or dict(
             drivable=True,
@@ -182,6 +285,10 @@ class FisheyeBEVMultiTaskHead(BaseModule):
         self.balance_marking = balance_marking
         self.balance_obstacle = balance_obstacle
         self.max_balance_factor = max_balance_factor
+        self.marking_dilate_kernel = marking_dilate_kernel
+        self.marking_dice_weight = marking_dice_weight
+        self.drivable_dilate_kernel = drivable_dilate_kernel
+        self.use_simple_drivable = use_simple_drivable
         # 记录 ignore_index 与 class_weight 供 sigmoid/BCE 使用
         self.drivable_ignore = loss_drivable.get('ignore_index', 255)
         self.marking_ignore = loss_marking.get('ignore_index', 255)
@@ -193,6 +300,36 @@ class FisheyeBEVMultiTaskHead(BaseModule):
         self.obstacle_class_weight = torch.as_tensor(
             loss_obstacle.get('weight', [1.0] * obstacle_classes), dtype=torch.float32)
 
+        # 多尺度上下文增强（空洞卷积 ASPP 风格）
+        ctx_planes = in_channels // 2
+        self.context_branches = nn.ModuleList([
+            nn.Conv2d(in_channels, ctx_planes, 3, padding=1, dilation=1, bias=False),
+            nn.Conv2d(in_channels, ctx_planes, 3, padding=2, dilation=2, bias=False),
+            nn.Conv2d(in_channels, ctx_planes, 3, padding=3, dilation=3, bias=False),
+        ])
+        self.context_fuse = nn.Sequential(
+            nn.Conv2d(ctx_planes * 3, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.se_shared_in = SEBlock(in_channels, reduction=8)
+        self.sa_shared_in = SpatialAttention(kernel_size=7)
+        # 轻量 Pyramid Pooling，补充全局上下文
+        ppm_out = in_channels // 2
+        self.ppm_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(scale),
+                nn.Conv2d(in_channels, ppm_out, 1, bias=False),
+                nn.GroupNorm(32, ppm_out),
+                nn.ReLU(inplace=True))
+            for scale in (1, 2, 3)
+        ])
+        self.ppm_fuse = nn.Sequential(
+            nn.Conv2d(in_channels + ppm_out * 3, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+        )
+
         self.shared = nn.Sequential(
             nn.Conv2d(in_channels, shared_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(shared_channels),
@@ -203,15 +340,92 @@ class FisheyeBEVMultiTaskHead(BaseModule):
         )
 
         if self.enable_drivable:
+            self.drivable_shallow = ConvModule(
+                in_channels,
+                shared_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+                norm_cfg=dict(type='BN'),
+                act_cfg=dict(type='ReLU', inplace=True))
+            # 额外高分辨率分支（保持原分辨率细节）
+            self.drivable_highres = nn.Sequential(
+                nn.Conv2d(in_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.drivable_adapter = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.drivable_fuse = nn.Sequential(
+                nn.Conv2d(shared_channels * 3, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.drivable_refine = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            # 大核/小核双分支强化
+            self.drivable_big = nn.Conv2d(shared_channels, shared_channels, 5, padding=2, bias=False)
+            self.drivable_small = nn.Conv2d(shared_channels, shared_channels, 1, bias=False)
+            # PPM 特征融合 + refine
+            self.drivable_ppm = ASPPModule(shared_channels, shared_channels, dilations=(1, 3, 6))
+            self.drivable_ppm_refine = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            # ASPP + 空间注意力增强可行驶上下文
+            self.drivable_aspp = ASPPModule(shared_channels, shared_channels, dilations=(1, 3, 6))
+            self.drivable_sa = SpatialAttention(kernel_size=7)
+            # 简化版 head（用于快速验证，避免复杂分支导致梯度消失）
+            self.drivable_simple = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(shared_channels, drivable_classes, kernel_size=1),
+            )
             self.drivable_head = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
                 nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
                 nn.BatchNorm2d(shared_channels),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(shared_channels, drivable_classes, kernel_size=1))
             self.loss_drivable = _build_loss_module(loss_drivable)
+            self.loss_drivable_dice = self._build_dice_loss(
+                class_weight=getattr(self.loss_drivable, 'weight', None),
+                loss_weight=1.0)
+            # 额外浅层辅助头，鼓励早期特征学习 drivable，权重为主头的一半
+            aux_cfg = loss_drivable.copy()
+            aux_cfg['loss_weight'] = loss_drivable.get('loss_weight', 1.0) * 0.5
+            self.drivable_aux_head = nn.Conv2d(shared_channels, drivable_classes, kernel_size=1)
+            self.loss_drivable_aux = _build_loss_module(aux_cfg)
         else:
             self.drivable_head = None
             self.loss_drivable = None
+            self.loss_drivable_dice = None
+            self.drivable_adapter = None
+            self.drivable_aux_head = None
+            self.loss_drivable_aux = None
+            self.drivable_shallow = None
+            self.drivable_fuse = None
+            self.drivable_refine = None
+            self.drivable_aspp = None
+            self.drivable_sa = None
+        # 前景先验，避免初始全背景（logit prior）
+        self.drivable_prior = 0.01
 
         if self.enable_marking:
             padding_v = (line_kernel // 2, 0)
@@ -236,26 +450,71 @@ class FisheyeBEVMultiTaskHead(BaseModule):
                 nn.BatchNorm2d(shared_channels),
                 nn.ReLU(inplace=True),
             )
+            self.marking_adapter = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            # 融合浅层 BEV 细节（来自原始 bev_feat）
+            self.marking_shallow = nn.Sequential(
+                nn.Conv2d(in_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
             self.marking_fuse = nn.Sequential(
                 nn.Conv2d(shared_channels * 2, shared_channels, 3, padding=1, bias=False),
                 nn.BatchNorm2d(shared_channels),
                 nn.ReLU(inplace=True),
             )
+            # 额外细化一层，增强纹理与线条
+            self.marking_refine = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            # 高分辨率解码：再做一次卷积后上采样
+            self.marking_highres = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            )
+            # 高分辨率分支再融合一次
+            self.marking_highres_refine = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
+            # 上采样后再细化一层
+            self.marking_post = nn.Sequential(
+                nn.Conv2d(shared_channels, shared_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(shared_channels),
+                nn.ReLU(inplace=True),
+            )
             self.marking_cls = nn.Conv2d(shared_channels, marking_classes, kernel_size=1)
+            self.boundary_head = nn.Conv2d(shared_channels, 1, kernel_size=1)
             self.loss_marking = _build_loss_module(loss_marking)
-            self.loss_boundary = None
+            self.loss_boundary = _build_loss_module(
+                loss_boundary, default_type='BCEWithLogitsLoss')
             self.loss_marking_dice = self._build_dice_loss(
                 class_weight=getattr(self.loss_marking, 'weight', None),
-                loss_weight=2.0)
+                loss_weight=self.marking_dice_weight)
         else:
             self.marking_decoder = None
             self.marking_vertical = None
             self.marking_horizontal = None
             self.marking_fuse = None
+            self.marking_shallow = None
+            self.marking_highres = None
+            self.marking_highres_refine = None
+            self.marking_post = None
             self.marking_cls = None
             self.loss_marking = None
             self.loss_boundary = None
             self.loss_marking_dice = None
+            self.marking_refine = None
+            self.boundary_head = None
+            self.marking_adapter = None
 
         if self.enable_slot:
             self.slot_decoder = nn.Sequential(
@@ -312,20 +571,74 @@ class FisheyeBEVMultiTaskHead(BaseModule):
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
                 kaiming_init(module)
+        # 为 drivable 输出设置前景先验 bias，防止初始全背景
+        if self.enable_drivable and self.drivable_head is not None:
+            last = self.drivable_head[-1]
+            if hasattr(last, 'bias') and last.bias is not None:
+                # bias = log(p/(1-p))
+                import math
+                p = 0.5  # 拉高前景先验，避免预测坍塌到全背景
+                last.bias.data.fill_(math.log(p / (1 - p)))
 
     def forward(self, bev_feat):
         """返回启用分支的预测字典."""
         if isinstance(bev_feat, (list, tuple)):
             bev_feat = bev_feat[0]
+        # 上下文增强
+        ctx_feats = [branch(bev_feat) for branch in self.context_branches]
+        ctx = torch.cat(ctx_feats, dim=1)
+        bev_feat = self.context_fuse(ctx)
+        bev_feat = self.se_shared_in(bev_feat)
+        bev_feat = self.sa_shared_in(bev_feat)
+        # PPM 追加全局语义
+        ppm_feats = [bev_feat]
+        for conv in self.ppm_convs:
+            ppm_feats.append(F.interpolate(conv(bev_feat), size=bev_feat.shape[-2:], mode='bilinear', align_corners=False))
+        bev_feat = self.ppm_fuse(torch.cat(ppm_feats, dim=1))
+
         shared = self.shared(bev_feat)
         preds = {}
         if self.enable_drivable:
-            preds['drivable'] = self.drivable_head(shared)
+            if getattr(self, 'use_simple_drivable', False):
+                preds['drivable'] = self.drivable_simple(shared)
+            else:
+                drivable_feat = shared
+                if self.drivable_adapter is not None:
+                    drivable_feat = self.drivable_adapter(drivable_feat)
+                if self.drivable_shallow is not None:
+                    shallow = self.drivable_shallow(bev_feat)
+                    highres = self.drivable_highres(bev_feat) if hasattr(self, 'drivable_highres') else shallow
+                    drivable_feat = self.drivable_fuse(torch.cat([drivable_feat, shallow, highres], dim=1))
+                if self.drivable_refine is not None:
+                    drivable_feat = self.drivable_refine(drivable_feat)
+                if hasattr(self, 'drivable_big') and hasattr(self, 'drivable_small'):
+                    drivable_feat = self.drivable_big(drivable_feat) + self.drivable_small(drivable_feat)
+                if hasattr(self, 'drivable_ppm'):
+                    drivable_feat = self.drivable_ppm(drivable_feat)
+                    drivable_feat = self.drivable_ppm_refine(drivable_feat)
+                if self.drivable_aspp is not None:
+                    drivable_feat = self.drivable_aspp(drivable_feat)
+                if self.drivable_sa is not None:
+                    drivable_feat = self.drivable_sa(drivable_feat)
+                preds['drivable'] = self.drivable_head(drivable_feat)
+                preds['drivable_aux'] = self.drivable_aux_head(drivable_feat)
         if self.enable_marking:
             feat_v = self.marking_vertical(shared)
             feat_h = self.marking_horizontal(shared)
             marking_feat = self.marking_fuse(torch.cat([feat_v, feat_h], dim=1))
+            # 浅层 BEV 细节加和
+            if self.marking_shallow is not None:
+                marking_feat = marking_feat + self.marking_shallow(bev_feat)
+            if self.marking_refine is not None:
+                marking_feat = self.marking_refine(marking_feat)
             marking_feat = self.marking_decoder(marking_feat)
+            if self.marking_adapter is not None:
+                marking_feat = self.marking_adapter(marking_feat)
+            marking_feat = self.marking_highres(marking_feat)
+            if self.marking_highres_refine is not None:
+                marking_feat = self.marking_highres_refine(marking_feat)
+            if self.marking_post is not None:
+                marking_feat = self.marking_post(marking_feat)
             preds['marking'] = self.marking_cls(marking_feat)
             if getattr(self, 'boundary_head', None) is not None:
                 preds['marking_boundary'] = self.boundary_head(marking_feat)
@@ -438,18 +751,39 @@ class FisheyeBEVMultiTaskHead(BaseModule):
         losses = {}
         if self.loss_drivable is not None and 'gt_drivable_mask' in targets:
             gt = self._prepare_class_target(targets['gt_drivable_mask'])
-            losses['loss_drivable'] = self._sigmoid_class_loss(
-                preds['drivable'], gt, self.loss_drivable,
-                self.drivable_class_weight, self.drivable_ignore,
-                self.pos_topk_ratio, self.neg_pos_ratio,
-                balance_pos_neg=self.balance_drivable,
-                max_balance_factor=self.max_balance_factor)
+            gt = self._dilate_marking(gt, kernel=self.drivable_dilate_kernel, ignore_index=self.drivable_ignore)
+            # 如果是 CE，走 softmax 分支避免形状不匹配
+            if hasattr(self.loss_drivable, 'criterion') and isinstance(self.loss_drivable.criterion, nn.CrossEntropyLoss):
+                gt_ce = self._resize_class_target(gt, preds['drivable'])
+                losses['loss_drivable'] = self._cross_entropy_class_loss(
+                    preds['drivable'], gt_ce, self.loss_drivable,
+                    self.drivable_class_weight, self.drivable_ignore)
+                if getattr(self, 'loss_drivable_aux', None) is not None and 'drivable_aux' in preds:
+                    gt_aux = self._resize_class_target(gt, preds['drivable_aux'])
+                    losses['loss_drivable_aux'] = self._cross_entropy_class_loss(
+                        preds['drivable_aux'], gt_aux, self.loss_drivable_aux,
+                        self.drivable_class_weight, self.drivable_ignore)
+            else:
+                losses['loss_drivable'] = self._sigmoid_class_loss(
+                    preds['drivable'], gt, self.loss_drivable,
+                    self.drivable_class_weight, self.drivable_ignore,
+                    self.pos_topk_ratio, self.neg_pos_ratio,
+                    balance_pos_neg=self.balance_drivable,
+                    max_balance_factor=self.max_balance_factor)
+                if getattr(self, 'loss_drivable_aux', None) is not None and 'drivable_aux' in preds:
+                    losses['loss_drivable_aux'] = self._sigmoid_class_loss(
+                        preds['drivable_aux'], gt, self.loss_drivable_aux,
+                        self.drivable_class_weight, self.drivable_ignore,
+                        self.pos_topk_ratio, self.neg_pos_ratio,
+                        balance_pos_neg=self.balance_drivable,
+                        max_balance_factor=self.max_balance_factor)
         if getattr(self, 'loss_drivable_dice', None) is not None and 'gt_drivable_mask' in targets:
             gt = self._prepare_class_target(targets['gt_drivable_mask'])
             gt = self._resize_class_target(gt, preds['drivable'])
             losses['loss_drivable_dice'] = self.loss_drivable_dice(preds['drivable'], gt)
         if self.loss_marking is not None and 'gt_marking_mask' in targets:
             gt_mark = self._prepare_class_target(targets['gt_marking_mask'])
+            gt_mark = self._dilate_marking(gt_mark, kernel=self.marking_dilate_kernel)
             # 如果是 CrossEntropyLoss 走 softmax 分支，避免 one-hot 尺寸错配
             if hasattr(self.loss_marking, 'criterion') and isinstance(
                     self.loss_marking.criterion, nn.CrossEntropyLoss):
@@ -466,8 +800,14 @@ class FisheyeBEVMultiTaskHead(BaseModule):
                     max_balance_factor=self.max_balance_factor)
         if getattr(self, 'loss_marking_dice', None) is not None and 'gt_marking_mask' in targets:
             gt_mark = self._prepare_class_target(targets['gt_marking_mask'])
+            gt_mark = self._dilate_marking(gt_mark, kernel=self.marking_dilate_kernel)
             gt_mark = self._resize_class_target(gt_mark, preds['marking'])
             losses['loss_marking_dice'] = self.loss_marking_dice(preds['marking'], gt_mark)
+        if self.loss_boundary is not None and 'gt_marking_boundary' in targets and 'marking_boundary' in preds:
+            boundary = targets['gt_marking_boundary']
+            boundary = self._resize_binary_target(boundary, preds['marking_boundary'])
+            losses['loss_marking_boundary'] = self.loss_boundary(
+                preds['marking_boundary'], boundary)
         if self.loss_slot is not None and 'gt_slot_masks' in targets:
             slot = self._prepare_slot_target(targets['gt_slot_masks'])
             slot = self._resize_binary_target(slot, preds['slot'])
@@ -560,3 +900,23 @@ class FisheyeBEVMultiTaskHead(BaseModule):
             cw = class_weight.to(pred.device)
             criterion.criterion.weight = cw
         return criterion(pred, target)
+
+    @staticmethod
+    def _dilate_marking(target, kernel=3, ignore_index=255):
+        """对标线前景做轻微膨胀，缓解极端稀疏。仅支持二分类：0 背景 / 1 前景。"""
+        if isinstance(kernel, str):
+            try:
+                kernel = int(kernel)
+            except Exception:
+                kernel = None
+        if kernel is None or kernel <= 1:
+            return target
+        if target.dim() != 3:
+            return target
+        fg = (target == 1).float()
+        fg = F.max_pool2d(fg, kernel_size=kernel, stride=1, padding=kernel // 2)
+        dilated = (fg > 0).long()
+        out = target.clone()
+        valid = target != ignore_index
+        out[valid] = dilated[valid]
+        return out

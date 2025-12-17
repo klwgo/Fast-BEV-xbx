@@ -163,6 +163,14 @@ class FastBEV(BaseDetector):
         return torch.stack(projection)
 
     def extract_feat(self, img, img_metas, mode):
+        # 兼容 DataContainer / list 输入
+        from mmcv.parallel import DataContainer
+        if isinstance(img, DataContainer):
+            img = img.data[0]
+        if isinstance(img, (list, tuple)):
+            # DataContainer 内可能是 list[Tensor]
+            if len(img) == 1 and isinstance(img[0], torch.Tensor):
+                img = img[0]
         batch_size = img.shape[0]
         img = img.reshape(
             [-1] + list(img.shape)[2:]
@@ -362,26 +370,44 @@ class FastBEV(BaseDetector):
 
         lidar2img = img_meta["lidar2img"]
         # 读取鱼眼相机参数（支持每帧多相机独立标定）
-        intrinsic_raw = lidar2img.get(self.fisheye_intrinsic_key)
+        # 兼容多种 key 命名：优先使用配置中的 key，若缺失则回退到常见的 'intrinsic' / 'intrinsics'
+        intrinsic_raw = lidar2img.get(self.fisheye_intrinsic_key, None)
+        if intrinsic_raw is None:
+            intrinsic_raw = lidar2img.get("intrinsic", None)
+        if intrinsic_raw is None:
+            intrinsic_raw = lidar2img.get("intrinsics", None)
         if intrinsic_raw is None:
             raise KeyError("Fish-eye intrinsics not found in img_meta['lidar2img'].")
-        # 兼容 3x3 或 4x4 齐次内参矩阵，只保留前 3x3 投影部分
-        intrinsic = torch.as_tensor(intrinsic_raw)
-        if intrinsic.ndim == 2 and intrinsic.shape[0] == 4:
-            intrinsic = intrinsic[:3, :3]
-        elif intrinsic.ndim == 3 and intrinsic.shape[1] == 4:
-            intrinsic = intrinsic[:, :3, :3]
+        # 支持 radial 参数字典列表；否则按矩阵处理
+        if isinstance(intrinsic_raw, (list, tuple, dict)):
+            intrinsic = intrinsic_raw
+        else:
+            intrinsic = torch.as_tensor(intrinsic_raw)
+            if intrinsic.ndim == 2 and intrinsic.shape[0] == 4:
+                intrinsic = intrinsic[:3, :3]
+            elif intrinsic.ndim == 3 and intrinsic.shape[1] == 4:
+                intrinsic = intrinsic[:, :3, :3]
 
         # 外参通常为多个相机的 4x4 齐次矩阵
         extrinsics = [torch.as_tensor(ex) for ex in lidar2img["extrinsic"]]
 
         distortion_raw = None
         if self.fisheye_distortion_key is not None:
-            distortion_raw = lidar2img.get(self.fisheye_distortion_key)
+            # 注意：畸变是 ndarray 时，不能用 “or” 判断，否则触发多元素布尔错误
+            distortion_raw = lidar2img.get(self.fisheye_distortion_key, None)
+            if distortion_raw is None:
+                distortion_raw = lidar2img.get("distortion", None)
+            if distortion_raw is None:
+                distortion_raw = lidar2img.get("distortions", None)
         distortion = None
         if distortion_raw is not None:
             # 畸变参数可能按相机存储成列表
-            distortion = [torch.as_tensor(d) for d in distortion_raw]
+            distortion = []
+            for d in distortion_raw:
+                if d is None:
+                    distortion.append(None)
+                else:
+                    distortion.append(torch.as_tensor(d))
 
         model_list = None
         if self.fisheye_model_key is not None and self.fisheye_model_key in lidar2img:

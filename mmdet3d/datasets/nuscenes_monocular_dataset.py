@@ -124,33 +124,67 @@ class NuScenesMultiViewDataset(MultiViewMixin, NuScenesDataset):
             except Exception:
                 print(f"[Fast-BEV] Expected 6 cameras, got {n_cameras}. Continue with adaptive visualization.")
 
+        lidar2img_src = data_info.get('lidar2img', {})
+        if not isinstance(lidar2img_src, dict):
+            lidar2img_src = {}
+        intrinsic_meta = lidar2img_src.get('intrinsic', np.eye(4, dtype=np.float32))
+        lidar2img_raw = data_info.get('lidar2img', [])
+        if isinstance(lidar2img_raw, dict):
+            extrinsics_raw = lidar2img_raw.get('extrinsic', [])
+            lidar2img_aug = data_info.get('lidar2img_aug', lidar2img_raw.get('lidar2img_aug', []))
+            lidar2img_extra = data_info.get('lidar2img_extra', lidar2img_raw.get('lidar2img_extra', []))
+        else:
+            extrinsics_raw = lidar2img_raw
+            lidar2img_aug = data_info['lidar2img_aug']
+            lidar2img_extra = data_info['lidar2img_extra']
+
         new_info = dict(
             sample_idx=data_info['sample_idx'],
             img_prefix=[None] * n_cameras,
             img_info=[dict(filename=x) for x in data_info['img_filename']],
             lidar2img=dict(
-                extrinsic=[tofloat(x) for x in data_info['lidar2img']],
-                intrinsic=np.eye(4, dtype=np.float32),
-                lidar2img_aug=data_info['lidar2img_aug'],
-                lidar2img_extra=data_info['lidar2img_extra']
-            )
+                extrinsic=[tofloat(x) for x in extrinsics_raw],
+                intrinsic=tofloat(intrinsic_meta),
+                intrinsics=tofloat(intrinsic_meta),
+                lidar2img_aug=lidar2img_aug,
+                lidar2img_extra=lidar2img_extra,
+                model=lidar2img_src.get('model', lidar2img_src.get('models', None)),
+                distortion=lidar2img_src.get('distortion', lidar2img_src.get('distortions', None)),
+                radial_params=lidar2img_src.get('radial_params', None),
+                cam_names=lidar2img_src.get('cam_names', None),
+                # FastBEV 期望 meta 中包含 origin 字段，这里默认使用 0 向量兜底
+                origin=lidar2img_src.get('origin', np.zeros(3, dtype=np.float32)),
+            ),
+            # 透传原始 ann_info，避免下游丢失 BEV 标注
+            ann_info=data_info.get('ann_info', {})
         )
-        if 'ann_info' in data_info:
-            gt_bboxes_3d = data_info['ann_info']['gt_bboxes_3d']
-            gt_labels_3d = data_info['ann_info']['gt_labels_3d'].copy()
+        if 'ann_info' in data_info and 'gt_bboxes_3d' in data_info['ann_info']:
+            ann_src = data_info['ann_info']
+            gt_bboxes_3d = ann_src['gt_bboxes_3d']
+            gt_labels_3d = ann_src['gt_labels_3d'].copy()
             mask = gt_labels_3d >= 0
             gt_bboxes_3d = gt_bboxes_3d[mask]
-            gt_names = data_info['ann_info']['gt_names'][mask]
+            gt_names = ann_src['gt_names'][mask]
             gt_labels_3d = gt_labels_3d[mask]
-            new_info['ann_info'] = dict(
+            ann_info = dict(
                 gt_bboxes_3d=gt_bboxes_3d,
                 gt_names=gt_names,
                 gt_labels_3d=gt_labels_3d
             )
+            # 透传 BEV 相关标注
+            for key in ['gt_bev_seg', 'bev_seg_classes', 'bev_marking_path', 'bev_obstacle_path']:
+                if key in ann_src:
+                    ann_info[key] = ann_src[key]
+            new_info['ann_info'] = ann_info
         return new_info
 
     def evaluate(self, results, *args, **kwargs):
         # update boxes with zero velocity
+        if len(results) == 0:
+            return {}
+        # 若结果不含 3D 检测（仅 BEV 分割等），直接返回空 dict 避免 KeyError
+        if 'boxes_3d' not in results[0]:
+            return {}
         new_results = []
         for i in range(len(results)):
             box_type = type(results[i]['boxes_3d'])

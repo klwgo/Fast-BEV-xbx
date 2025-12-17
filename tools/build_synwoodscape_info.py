@@ -254,18 +254,28 @@ def load_calibrations(calib_dir: Path) -> Dict[str, dict]:
         distortion = np.array(
             [float(intrinsic_info.get(f'k{i}', 0.0)) for i in range(1, 5)],
             dtype=np.float32)
+        radial_params = dict(
+            k1=float(intrinsic_info.get('k1', 0.0)),
+            k2=float(intrinsic_info.get('k2', 0.0)),
+            k3=float(intrinsic_info.get('k3', 0.0)),
+            k4=float(intrinsic_info.get('k4', 0.0)),
+            cx_offset=float(intrinsic_info.get('cx_offset', 0.0)),
+            cy_offset=float(intrinsic_info.get('cy_offset', 0.0)),
+            aspect_ratio=float(intrinsic_info.get('aspect_ratio', 1.0) or 1.0),
+            width=float(width),
+            height=float(height),
+        )
         quat = extrinsic_info.get('quaternion', [1.0, 0.0, 0.0, 0.0])
         trans = extrinsic_info.get(
             'translation used in CARLA (CARLA reference)',
             extrinsic_info.get('translation', [0.0, 0.0, 0.0])
         )
-        model = intrinsic_info.get('model', 'polynomial')
-        if model == 'radial_poly':
-            model = 'polynomial'
+        model = intrinsic_info.get('model', 'radial_poly')
 
         calibs[name] = dict(
             intrinsic=cam_intrinsic,
             distortion=distortion,
+            radial_params=radial_params,
             quaternion=np.asarray(quat, dtype=np.float32),
             translation=np.asarray(trans, dtype=np.float32),
             width=width,
@@ -542,6 +552,7 @@ def main():
             intrinsic = np.eye(3, dtype=np.float32)
             distortion = np.zeros(4, dtype=np.float32)
             cam_model = 'polynomial'
+            radial_params = None
 
             if calib is not None:
                 rot_carla = quaternion_wxyz_to_matrix(calib['quaternion'])
@@ -550,6 +561,7 @@ def main():
                 intrinsic = calib['intrinsic'].astype(np.float32)
                 distortion = calib['distortion'].astype(np.float32)
                 cam_model = calib['model']
+                radial_params = calib.get('radial_params')
 
             if cam_height is None or cam_width is None:
                 img = mmcv.imread(img_path)
@@ -577,6 +589,12 @@ def main():
             label_id_array = np.asarray(label_ids, dtype=np.int64).reshape(-1)
             label_name_array = np.asarray(label_names, dtype=object)
 
+            # 构建传感器->ego 4x4，再求逆得到 lidar(假设=ego)->cam 外参
+            sensor2ego_mat = np.eye(4, dtype=np.float32)
+            sensor2ego_mat[:3, :3] = quaternion_wxyz_to_matrix(sensor_rot)
+            sensor2ego_mat[:3, 3] = sensor_trans
+            lidar2cam = np.linalg.inv(sensor2ego_mat)  # 假设 lidar=ego
+
             cam_info = dict(
                 data_path=str(img_path),
                 prev_data_path=str(prev_path) if prev_path.exists() else '',
@@ -592,6 +610,8 @@ def main():
                 cam_intrinsic=intrinsic,
                 cam_distortion=distortion,
                 cam_model=cam_model,
+                cam_radial_params=radial_params,
+                extrinsic=lidar2cam.tolist(),  # lidar(=ego) -> cam
             )
             cam_info['annos'] = dict(
                 bbox=bbox_array,

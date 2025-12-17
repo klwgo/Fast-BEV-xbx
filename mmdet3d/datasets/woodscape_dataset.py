@@ -194,6 +194,7 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
 
         intrinsics = []
         distortions = []
+        radial_params_list = []
         models = []
         for cam_name in self.camera_types:
             cam_meta = self.data_infos[index]['cams'][cam_name]
@@ -203,6 +204,7 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             distortions.append(self._to_float_array(
                 cam_meta.get('cam_distortion', np.zeros(4)), shape=(-1,)))
             models.append(cam_meta.get('cam_model', 'polynomial'))
+            radial_params_list.append(cam_meta.get('cam_radial_params', None))
         intr_stack = np.stack(intrinsics, axis=0)
         distortion_list = [d.astype(np.float32) for d in distortions]
         distortion_primary = distortion_list[0] if distortion_list else np.zeros(4, dtype=np.float32)
@@ -218,6 +220,11 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
             distortion=distortion_primary,
             distortions=distortion_list,
             models=models,
+            model=models,
+            cam_model=models,
+            radial_params=radial_params_list,
+            cam_radial_params=radial_params_list,
+            cam_names=list(self.camera_types),
             origin=np.zeros(3, dtype=np.float32),
         )
 
@@ -477,8 +484,9 @@ class WoodScapeMultiViewDataset(NuScenesMultiViewDataset):
                 logger.info('WoodScape evaluation (IoU {:.2f}): {}'.format(
                     iou_thr, eval_results))
             else:
-                logger.info('WoodScape 2D evaluation: {}'.format(eval_results))
-
+                # 仅保留 Runner 汇总行，屏蔽额外指标字典打印
+                # logger.info('WoodScape 2D evaluation: {}'.format(eval_results))
+                pass
         return eval_results
 
     def get_ann_info(self, index):

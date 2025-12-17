@@ -246,6 +246,8 @@ class NuScenesDataset(Custom3DDataset):
             sweeps=info['sweeps'],
             timestamp=info['timestamp'] / 1e6,
         )
+        if 'ann_info' in info:
+            input_dict['ann_info'] = info['ann_info']
         if self.modality['use_camera']:
             image_paths = []
             lidar2img_rts = []
@@ -491,6 +493,11 @@ class NuScenesDataset(Custom3DDataset):
             gt_labels_3d=gt_labels_3d,
             gt_names=gt_names_3d
         )
+        # 透传额外 BEV 标注（若原始 info 提供）
+        extra_ann = info.get('ann_info', {})
+        for key in ['gt_bev_seg', 'bev_seg_classes', 'bev_marking_path', 'bev_obstacle_path']:
+            if key in extra_ann:
+                anns_results[key] = extra_ann[key]
         return anns_results
 
     def _format_bbox(self, results, jsonfile_prefix=None):
